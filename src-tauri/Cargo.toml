@@ -1,0 +1,49 @@
+[package]
+name = "recall-evolution"
+version = "0.1.0"
+description = "Local-first memory evolution for Codex and Claude Code"
+authors = ["Recall"]
+edition = "2021"
+default-run = "recall-evolution"
+
+[lib]
+name = "recall_evolution_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "recall-evolution"
+path = "src/main.rs"
+
+[[bin]]
+name = "evolution-mcp"
+path = "src/bin/evolution_mcp.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+walkdir = "2"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rig-core = { version = "0.40", default-features = false, features = ["reqwest", "rustls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+notify = "6"
+toml_edit = "0.22"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

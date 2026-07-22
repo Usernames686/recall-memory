@@ -1,0 +1,60 @@
+use crate::paths;
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
+use std::path::Path;
+use tauri::{AppHandle, Emitter};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceDirtyEvent {
+    provider: String,
+    source: String,
+}
+
+pub fn start(app: AppHandle) -> notify::Result<RecommendedWatcher> {
+    let callback_app = app.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |result: notify::Result<Event>| {
+            let Ok(event) = result else { return };
+            for path in event.paths {
+                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let provider = provider_for(&path);
+                let _ = callback_app.emit(
+                    "source-dirty",
+                    SourceDirtyEvent {
+                        provider: provider.to_string(),
+                        source: hashed_source(&path),
+                    },
+                );
+            }
+        },
+        Config::default(),
+    )?;
+
+    for path in [
+        paths::codex_home().join("sessions"),
+        paths::codex_home().join("archived_sessions"),
+        paths::claude_home().join("projects"),
+    ] {
+        if path.is_dir() {
+            watcher.watch(&path, RecursiveMode::Recursive)?;
+        }
+    }
+    Ok(watcher)
+}
+
+fn provider_for(path: &Path) -> &'static str {
+    if path.starts_with(paths::claude_home()) {
+        "claude-code"
+    } else {
+        "codex"
+    }
+}
+
+fn hashed_source(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    hex::encode(digest)[..12].to_string()
+}
