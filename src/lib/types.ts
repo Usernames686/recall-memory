@@ -2,6 +2,8 @@ export type Provider = "codex" | "claude-code"
 export type EntryKind = "meta" | "skill" | "revision"
 export type EntryStatus = "active" | "pending" | "disabled" | "rejected"
 export type ContextMode = "mcp" | "guided"
+export type AgentMode = "reflection" | "verification"
+export type ModelProvider = "remote" | "ollama"
 
 export interface SourceSummary {
   provider: Provider
@@ -67,6 +69,7 @@ export interface EvolutionSettings {
   maxAgentSteps: number
   launchAtLogin: boolean
   notificationsEnabled: boolean
+  agentMode: AgentMode
 }
 
 export interface EvolutionRunState {
@@ -85,19 +88,42 @@ export interface EvolutionRunState {
   providers: Provider[]
   lookbackDays: number
   rolledBackAt?: number
+  agentMode: AgentMode
+  traceCount: number
+  verificationStatus: "not_run" | "passed" | "review_required" | "failed" | string
+  verificationSummary?: string
+}
+
+export interface AgentTraceEvent {
+  id: number
+  runId: string
+  occurredAt: number
+  phase: EvolutionPhase
+  eventType: string
+  toolName?: string
+  summary: string
+  durationMs?: number
+  resultStatus: string
+  errorCode?: string
 }
 
 export interface EvolutionRunDetail {
   run: EvolutionRunState
   activities: Activity[]
   entries: EvolutionEntry[]
+  traces: AgentTraceEvent[]
 }
 
 export interface ReflectionConfig {
+  provider: ModelProvider
   baseUrl: string
   model: string
   hasApiKey: boolean
   contextMode: ContextMode
+  timeoutSeconds: number
+  healthStatus: "unknown" | "checking" | "ok" | "error"
+  healthError?: string
+  lastCheckedAt?: number
 }
 
 export interface Snapshot {

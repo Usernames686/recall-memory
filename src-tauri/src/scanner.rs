@@ -66,7 +66,7 @@ pub fn scan_sources_with_options(
     ];
     let mut codex_source = SourceSummary {
         provider: "codex".to_string(),
-        root: codex_root.display().to_string(),
+        root: sanitize_cwd(&codex_root.display().to_string()),
         available: false,
         session_count: 0,
         activity_count: 0,
@@ -101,7 +101,7 @@ pub fn scan_sources_with_options(
     let claude_root = paths::claude_home();
     let mut claude_source = SourceSummary {
         provider: "claude-code".to_string(),
-        root: claude_root.display().to_string(),
+        root: sanitize_cwd(&claude_root.display().to_string()),
         available: false,
         session_count: 0,
         activity_count: 0,
@@ -173,7 +173,12 @@ fn scan_directory(
             .scan_cursor(&source_hash)
             .ok()
             .flatten()
-            .map(|cursor| cursor.size == size && cursor.modified_at == modified)
+            .map(|cursor| {
+                cursor.size == size
+                    && cursor.modified_at == modified
+                    && (cursor.oldest_activity_at == 0
+                        || activity_cutoff >= cursor.oldest_activity_at)
+            })
             .unwrap_or(false)
         {
             continue;
@@ -235,7 +240,19 @@ fn scan_directory(
                 summary.scanned_activities += parsed.activities.len() as i64;
                 summary.new_activities += inserted;
                 summary.sessions.push(session);
-                if let Err(err) = store.save_scan_cursor(&source_hash, provider, size, modified) {
+                let oldest_activity_at = parsed
+                    .activities
+                    .iter()
+                    .map(|activity| activity.occurred_at)
+                    .min()
+                    .unwrap_or(activity_cutoff);
+                if let Err(err) = store.save_scan_cursor(
+                    &source_hash,
+                    provider,
+                    size,
+                    modified,
+                    oldest_activity_at,
+                ) {
                     record_scan_error(summary, source, provider, entry.path(), &err.to_string());
                 }
             }
@@ -586,7 +603,7 @@ fn clean_text(text: String) -> Option<String> {
     }
 }
 
-fn redact(text: &str) -> String {
+pub(crate) fn redact(text: &str) -> String {
     let mut value = text.to_string();
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
@@ -819,6 +836,70 @@ mod tests {
         ).unwrap();
         assert_eq!(run(&store).new_activities, 1);
         assert_eq!(store.activity_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn expanding_history_window_rescans_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_dir = dir.path().join("sessions");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join("rollout.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-01T01:00:00Z","payload":{"id":"s1"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-02T01:00:00Z","payload":{"type":"user_message","message":"Older evidence"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-22T01:00:00Z","payload":{"type":"agent_message","message":"Recent evidence"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let run = |activity_cutoff: i64| {
+            let mut summary = ScanSummary {
+                days: 30,
+                sources: vec![],
+                sessions: vec![],
+                scanned_sessions: 0,
+                scanned_activities: 0,
+                new_activities: 0,
+                skipped_files: 0,
+                errors: vec![],
+            };
+            let mut source = SourceSummary {
+                provider: "codex".into(),
+                root: transcript_dir.display().to_string(),
+                available: true,
+                session_count: 0,
+                activity_count: 0,
+                error: None,
+                last_scanned_at: None,
+                error_count: 0,
+                cursor_count: 0,
+            };
+            scan_directory(
+                &store,
+                "codex",
+                &transcript_dir,
+                0,
+                activity_cutoff,
+                false,
+                &mut summary,
+                &mut source,
+            );
+            summary
+        };
+        let recent_cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let older_cutoff = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(run(recent_cutoff).new_activities, 1);
+        assert_eq!(run(older_cutoff).new_activities, 1);
+        assert_eq!(store.activity_count().unwrap(), 2);
     }
 
     #[test]

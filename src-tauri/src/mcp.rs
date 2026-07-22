@@ -1,4 +1,4 @@
-use crate::models::{CandidateInput, EvolutionEntry, McpInstallResult, McpStatus};
+use crate::models::{EvolutionEntry, McpInstallResult, McpStatus};
 use crate::paths;
 use crate::store::Store;
 use chrono::Utc;
@@ -8,7 +8,6 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml_edit::{value, DocumentMut, Item, Table};
-use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -88,18 +87,13 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "evolution_submit_candidate",
-            "description": "Submit a reusable Meta or Skill candidate for local review. This never directly overwrites active knowledge.",
+            "name": "evolution_run_status",
+            "description": "Read the latest Evolution Agent run state and its bounded redacted trace summaries. This tool is read-only.",
             "inputSchema": {
                 "type":"object",
                 "properties": {
-                    "kind":{"type":"string","enum":["meta","skill","revision"]},
-                    "title":{"type":"string","maxLength":120},
-                    "summary":{"type":"string","maxLength":360},
-                    "body":{"type":"string","maxLength":4000},
-                    "source_refs":{"type":"array","items":{"type":"string"},"maxItems":8}
+                    "limit":{"type":"integer","minimum":1,"maximum":100}
                 },
-                "required":["kind","title","summary","body"],
                 "additionalProperties":false
             }
         }),
@@ -117,7 +111,7 @@ fn call_tool(store: &Store, params: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| json!({}));
     let payload = match name {
         "evolution_context" => context_payload(store, &args)?,
-        "evolution_submit_candidate" => submit_candidate(store, &args)?,
+        "evolution_run_status" => run_status_payload(store, &args)?,
         _ => return Err(format!("unknown tool: {name}")),
     };
     Ok(
@@ -197,45 +191,43 @@ fn context_payload(store: &Store, args: &Value) -> Result<Value, String> {
     }
 }
 
-fn submit_candidate(store: &Store, args: &Value) -> Result<Value, String> {
-    let input: CandidateInput =
-        serde_json::from_value(args.clone()).map_err(|err| err.to_string())?;
-    let kind = input.kind.trim().to_lowercase();
-    if !matches!(kind.as_str(), "meta" | "skill" | "revision") {
-        return Err("invalid candidate kind".to_string());
-    }
-    if input.title.trim().is_empty()
-        || input.body.trim().is_empty()
-        || input.body.chars().count() > 4_000
-    {
-        return Err("candidate title/body is invalid".to_string());
-    }
-    let entry = EvolutionEntry {
-        id: format!("entry-{}", Uuid::new_v4()),
-        kind,
-        title: input.title.trim().chars().take(120).collect(),
-        summary: input.summary.trim().chars().take(360).collect(),
-        body: input.body.trim().chars().take(4_000).collect(),
-        status: "pending".to_string(),
-        risk: "review".to_string(),
-        source_refs: input.source_refs.into_iter().take(8).collect(),
-        updated_at: Utc::now().timestamp(),
-        origin_run_id: None,
-        target_entry_id: None,
-        version: 1,
+fn run_status_payload(store: &Store, args: &Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let Some(run) = store
+        .current_evolution_run()
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(json!({"run":null,"trace":[]}));
     };
-    store.insert_entry(&entry).map_err(|err| err.to_string())?;
-    Ok(
-        json!({"candidate_id":entry.id,"status":"pending","message":"Candidate submitted for local review"}),
-    )
+    let trace = store
+        .list_trace_events(&run.run_id, limit)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|event| {
+            json!({
+                "occurred_at": event.occurred_at,
+                "phase": event.phase,
+                "event_type": event.event_type,
+                "tool_name": event.tool_name,
+                "summary": event.summary,
+                "result_status": event.result_status,
+                "error_code": event.error_code
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({"run":run,"trace":trace}))
 }
 
 fn public_summary(entry: &EvolutionEntry) -> Value {
-    json!({"id":entry.id,"title":entry.title,"summary":entry.summary,"updated_at":entry.updated_at})
+    json!({"id":entry.id,"title":crate::scanner::redact(&entry.title),"summary":crate::scanner::redact(&entry.summary),"updated_at":entry.updated_at})
 }
 
 fn public_entry(entry: &EvolutionEntry) -> Value {
-    json!({"id":entry.id,"kind":entry.kind,"title":entry.title,"summary":entry.summary,"body":entry.body,"updated_at":entry.updated_at})
+    json!({"id":entry.id,"kind":entry.kind,"title":crate::scanner::redact(&entry.title),"summary":crate::scanner::redact(&entry.summary),"body":crate::scanner::redact(&entry.body),"updated_at":entry.updated_at})
 }
 
 fn build_context_text(meta: &[&EvolutionEntry], skills: &[&EvolutionEntry]) -> String {
@@ -246,18 +238,24 @@ fn build_context_text(meta: &[&EvolutionEntry], skills: &[&EvolutionEntry]) -> S
     let mut sections = vec!["## Recall Memory Context".to_string()];
     if !meta.is_empty() {
         sections.push("### Active Meta".to_string());
-        sections.extend(
-            meta.iter()
-                .map(|entry| format!("#### {}\n{}", entry.title, entry.body)),
-        );
+        sections.extend(meta.iter().map(|entry| {
+            format!(
+                "#### {}\n{}",
+                crate::scanner::redact(&entry.title),
+                crate::scanner::redact(&entry.body)
+            )
+        }));
     }
     if !skills.is_empty() {
         sections.push("### Available Learned Skills".to_string());
-        sections.extend(
-            skills
-                .iter()
-                .map(|entry| format!("- **{}** ({}): {}", entry.title, entry.id, entry.summary)),
-        );
+        sections.extend(skills.iter().map(|entry| {
+            format!(
+                "- **{}** ({}): {}",
+                crate::scanner::redact(&entry.title),
+                entry.id,
+                crate::scanner::redact(&entry.summary)
+            )
+        }));
         sections.push(
             "Use evolution_context(action=\"skill\", skill_id=\"...\") to load a full Skill body."
                 .to_string(),
@@ -583,27 +581,33 @@ mod tests {
     }
 
     #[test]
-    fn submitted_candidates_stay_pending_and_out_of_active_context() {
+    fn run_status_tool_is_read_only() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path().join("db.sqlite")).unwrap();
+        store.start_evolution_run("run-1", "manual").unwrap();
+        store
+            .append_trace_event(
+                "run-1",
+                "analyzing",
+                "tool_call",
+                Some("read_activity_batch"),
+                "读取脱敏活动",
+                Some(3),
+                "ok",
+                None,
+            )
+            .unwrap();
         let response = handle_request(
             &store,
             &serde_json::json!({
                 "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                    "name":"evolution_submit_candidate",
-                    "arguments":{"kind":"skill","title":"Candidate","summary":"Review me","body":"Do the thing","source_refs":["a1"]}
+                    "name":"evolution_run_status",
+                    "arguments":{"limit":10}
                 }
             }),
         );
-        assert!(response.to_string().contains("pending"));
-        assert_eq!(store.pending_count().unwrap(), 1);
-        let context = handle_request(
-            &store,
-            &serde_json::json!({
-                "jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"evolution_context","arguments":{"action":"list"}}
-            }),
-        );
-        assert!(!context.to_string().contains("Candidate"));
+        assert!(response.to_string().contains("read_activity_batch"));
+        assert_eq!(store.pending_count().unwrap(), 0);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use crate::models::{
-    Activity, AuditEvent, CacheCleanupPreview, EntryVersion, EntryVersionDiff, EvolutionEntry,
-    EvolutionRunDetail, EvolutionRunState, EvolutionSettingsInput, EvolutionSettingsView,
-    MaintenanceResult, RedactionCategoryCount, RedactionReport, ReflectionConfigView,
-    ReflectionRunResult, RunRollbackResult, SessionSummary, StoreBackup, StoreStats,
-    DEFAULT_CONTEXT_MODE,
+    Activity, AgentTraceEvent, AuditEvent, CacheCleanupPreview, EntryVersion, EntryVersionDiff,
+    EvolutionEntry, EvolutionRunDetail, EvolutionRunState, EvolutionSettingsInput,
+    EvolutionSettingsView, MaintenanceResult, RedactionCategoryCount, RedactionReport,
+    ReflectionConfigView, ReflectionRunResult, RunRollbackResult, SessionSummary, StoreBackup,
+    StoreStats, DEFAULT_AGENT_MODE, DEFAULT_CONTEXT_MODE, DEFAULT_MODEL_PROVIDER,
+    DEFAULT_MODEL_TIMEOUT_SECONDS,
 };
 use crate::paths;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
@@ -32,6 +33,7 @@ pub struct Store {
 pub struct ScanCursor {
     pub size: i64,
     pub modified_at: i64,
+    pub oldest_activity_at: i64,
 }
 
 impl Store {
@@ -128,8 +130,26 @@ impl Store {
                 model TEXT,
                 providers_json TEXT NOT NULL DEFAULT '[]',
                 lookback_days INTEGER NOT NULL DEFAULT 30,
-                rolled_back_at INTEGER
+                rolled_back_at INTEGER,
+                agent_mode TEXT NOT NULL DEFAULT 'reflection',
+                trace_count INTEGER NOT NULL DEFAULT 0,
+                verification_status TEXT NOT NULL DEFAULT 'not_run',
+                verification_summary TEXT
             );
+            CREATE TABLE IF NOT EXISTS agent_trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                tool_name TEXT,
+                summary TEXT NOT NULL,
+                duration_ms INTEGER,
+                result_status TEXT NOT NULL,
+                error_code TEXT
+            );
+            CREATE INDEX IF NOT EXISTS agent_trace_events_run_idx
+                ON agent_trace_events(run_id, occurred_at, id);
             CREATE TABLE IF NOT EXISTS evolution_run_activities (
                 run_id TEXT NOT NULL,
                 activity_id TEXT NOT NULL,
@@ -187,11 +207,21 @@ impl Store {
                 )?;
             }
         }
+        if !has_column(&conn, "scan_cursors", "oldest_activity_at")? {
+            conn.execute(
+                "ALTER TABLE scan_cursors ADD COLUMN oldest_activity_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         for (column, definition) in [
             ("model", "TEXT"),
             ("providers_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("lookback_days", "INTEGER NOT NULL DEFAULT 30"),
             ("rolled_back_at", "INTEGER"),
+            ("agent_mode", "TEXT NOT NULL DEFAULT 'reflection'"),
+            ("trace_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("verification_status", "TEXT NOT NULL DEFAULT 'not_run'"),
+            ("verification_summary", "TEXT"),
         ] {
             if !has_column(&conn, "evolution_runs", column)? {
                 conn.execute(
@@ -460,12 +490,13 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT size, modified_at FROM scan_cursors WHERE source_hash=?1",
+                "SELECT size, modified_at, oldest_activity_at FROM scan_cursors WHERE source_hash=?1",
                 [source_hash],
                 |row| {
                     Ok(ScanCursor {
                         size: row.get(0)?,
                         modified_at: row.get(1)?,
+                        oldest_activity_at: row.get(2)?,
                     })
                 },
             )
@@ -478,13 +509,15 @@ impl Store {
         provider: &str,
         size: i64,
         modified_at: i64,
+        oldest_activity_at: i64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO scan_cursors(source_hash, provider, size, modified_at, scanned_at)
-             VALUES (?1,?2,?3,?4,unixepoch())
+            "INSERT INTO scan_cursors(source_hash, provider, size, modified_at, oldest_activity_at, scanned_at)
+             VALUES (?1,?2,?3,?4,?5,unixepoch())
              ON CONFLICT(source_hash) DO UPDATE SET size=excluded.size,
-             modified_at=excluded.modified_at, scanned_at=excluded.scanned_at",
-            params![source_hash, provider, size, modified_at],
+             modified_at=excluded.modified_at, oldest_activity_at=excluded.oldest_activity_at,
+             scanned_at=excluded.scanned_at",
+            params![source_hash, provider, size, modified_at, oldest_activity_at],
         )?;
         Ok(())
     }
@@ -780,17 +813,53 @@ impl Store {
         providers: &[String],
         lookback_days: i64,
     ) -> Result<(), StoreError> {
+        self.start_evolution_run_with_agent_context(
+            run_id,
+            mode,
+            DEFAULT_AGENT_MODE,
+            model,
+            providers,
+            lookback_days,
+        )
+    }
+
+    pub fn start_evolution_run_with_agent_context(
+        &self,
+        run_id: &str,
+        mode: &str,
+        agent_mode: &str,
+        model: Option<&str>,
+        providers: &[String],
+        lookback_days: i64,
+    ) -> Result<(), StoreError> {
+        if !matches!(agent_mode, "reflection" | "verification") {
+            return Err(StoreError::InvalidSetting("invalid agent mode".into()));
+        }
         self.conn.execute(
             "INSERT INTO evolution_runs
-             (id, mode, phase, started_at, model, providers_json, lookback_days)
-             VALUES (?1, ?2, 'scanning', unixepoch(), ?3, ?4, ?5)",
+             (id, mode, phase, started_at, model, providers_json, lookback_days, agent_mode)
+             VALUES (?1, ?2, 'scanning', unixepoch(), ?3, ?4, ?5, ?6)",
             params![
                 run_id,
                 mode,
                 model,
                 serde_json::to_string(providers)?,
-                lookback_days
+                lookback_days,
+                agent_mode
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_run_verification(
+        &self,
+        run_id: &str,
+        status: &str,
+        summary: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE evolution_runs SET verification_status=?2, verification_summary=?3 WHERE id=?1",
+            params![run_id, status, summary],
         )?;
         Ok(())
     }
@@ -822,7 +891,8 @@ impl Store {
             .query_row(
                 "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                         consumed_activities, generated, activated, pending, error,
-                        model, providers_json, lookback_days, rolled_back_at
+                        model, providers_json, lookback_days, rolled_back_at,
+                        agent_mode, trace_count, verification_status, verification_summary
                  FROM evolution_runs ORDER BY started_at DESC LIMIT 1",
                 [],
                 read_evolution_run,
@@ -835,7 +905,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                     consumed_activities, generated, activated, pending, error,
-                    model, providers_json, lookback_days, rolled_back_at
+                    model, providers_json, lookback_days, rolled_back_at,
+                    agent_mode, trace_count, verification_status, verification_summary
              FROM evolution_runs ORDER BY started_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], read_evolution_run)?;
@@ -848,7 +919,8 @@ impl Store {
             .query_row(
                 "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                         consumed_activities, generated, activated, pending, error,
-                        model, providers_json, lookback_days, rolled_back_at
+                        model, providers_json, lookback_days, rolled_back_at,
+                        agent_mode, trace_count, verification_status, verification_summary
                  FROM evolution_runs WHERE id=?1",
                 [run_id],
                 read_evolution_run,
@@ -864,7 +936,73 @@ impl Store {
             run,
             activities: self.evolution_run_activities(run_id)?,
             entries,
+            traces: self.list_trace_events(run_id, 500)?,
         })
+    }
+
+    pub fn append_trace_event(
+        &self,
+        run_id: &str,
+        phase: &str,
+        event_type: &str,
+        tool_name: Option<&str>,
+        summary: &str,
+        duration_ms: Option<i64>,
+        result_status: &str,
+        error_code: Option<&str>,
+    ) -> Result<AgentTraceEvent, StoreError> {
+        let summary: String = crate::scanner::redact(summary).chars().take(500).collect();
+        self.conn.execute(
+            "INSERT INTO agent_trace_events
+             (run_id, occurred_at, phase, event_type, tool_name, summary, duration_ms, result_status, error_code)
+             VALUES (?1, unixepoch(), ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![run_id, phase, event_type, tool_name, summary, duration_ms, result_status, error_code],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "UPDATE evolution_runs SET trace_count=trace_count+1 WHERE id=?1",
+            [run_id],
+        )?;
+        Ok(AgentTraceEvent {
+            id,
+            run_id: run_id.to_string(),
+            occurred_at: chrono::Utc::now().timestamp(),
+            phase: phase.to_string(),
+            event_type: event_type.to_string(),
+            tool_name: tool_name.map(str::to_string),
+            summary,
+            duration_ms,
+            result_status: result_status.to_string(),
+            error_code: error_code.map(str::to_string),
+        })
+    }
+
+    pub fn list_trace_events(
+        &self,
+        run_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentTraceEvent>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, occurred_at, phase, event_type, tool_name, summary,
+                    duration_ms, result_status, error_code
+             FROM agent_trace_events WHERE run_id=?1
+             ORDER BY occurred_at, id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![run_id, limit.clamp(1, 1_000)], |row| {
+            Ok(AgentTraceEvent {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                occurred_at: row.get(2)?,
+                phase: row.get(3)?,
+                event_type: row.get(4)?,
+                tool_name: row.get(5)?,
+                summary: row.get(6)?,
+                duration_ms: row.get(7)?,
+                result_status: row.get(8)?,
+                error_code: row.get(9)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn recover_interrupted_runs(&self) -> Result<i64, StoreError> {
@@ -1045,6 +1183,15 @@ impl Store {
                 .flatten();
             if let Some(applied_version) = applied_version.filter(|version| *version > 1) {
                 if restored_targets.insert(target.to_string()) {
+                    let current_version: i64 =
+                        tx.query_row("SELECT version FROM entries WHERE id=?1", [target], |row| {
+                            row.get(0)
+                        })?;
+                    if current_version != applied_version {
+                        return Err(StoreError::InvalidSetting(format!(
+                            "cannot roll back run: target {target} changed after this run"
+                        )));
+                    }
                     apply_entry_version(
                         &tx,
                         target,
@@ -1401,14 +1548,38 @@ impl Store {
             "recall-redacted-{}.json",
             chrono::Utc::now().format("%Y%m%d-%H%M%S")
         ));
-        let payload = serde_json::json!({
+        let stats = self.store_stats()?;
+        let audit = self
+            .list_audit_events(1000)?
+            .into_iter()
+            .map(|event| {
+                serde_json::json!({
+                    "id": event.id,
+                    "occurredAt": event.occurred_at,
+                    "action": event.action,
+                    "objectId": event.object_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut payload = serde_json::json!({
             "exportedAt": chrono::Utc::now().timestamp(),
             "entries": self.list_entries()?,
             "runs": self.list_evolution_runs(500)?,
-            "audit": self.list_audit_events(1000)?,
-            "stats": self.store_stats()?,
+            "audit": audit,
+            "stats": {
+                "databaseBytes": stats.database_bytes,
+                "entryCount": stats.entry_count,
+                "activeCount": stats.active_count,
+                "pendingCount": stats.pending_count,
+                "versionCount": stats.version_count,
+                "activityCount": stats.activity_count,
+                "reflectedActivityCount": stats.reflected_activity_count,
+                "runCount": stats.run_count,
+                "auditCount": stats.audit_count
+            },
             "redactionReport": self.redaction_report()?
         });
+        sanitize_export_paths(&mut payload);
         fs::write(&path, serde_json::to_vec_pretty(&payload)?)?;
         self.append_audit(
             "redacted_store_exported",
@@ -1496,6 +1667,10 @@ impl Store {
             .and_then(|entry| entry.get_password().ok())
             .is_some();
         Ok(ReflectionConfigView {
+            provider: match get("provider")?.as_str() {
+                "ollama" => "ollama".to_string(),
+                _ => DEFAULT_MODEL_PROVIDER.to_string(),
+            },
             base_url: get("base_url")?,
             model: get("model")?,
             has_api_key: has_key,
@@ -1503,6 +1678,19 @@ impl Store {
                 "mcp" => "mcp".to_string(),
                 _ => DEFAULT_CONTEXT_MODE.to_string(),
             },
+            timeout_seconds: get("timeout_seconds")?
+                .parse::<i64>()
+                .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS)
+                .clamp(10, 300),
+            health_status: match get("health_status")?.as_str() {
+                "ok" | "error" | "checking" => get("health_status")?,
+                _ => "unknown".to_string(),
+            },
+            health_error: match get("health_error")?.trim() {
+                "" => None,
+                value => Some(value.chars().take(240).collect()),
+            },
+            last_checked_at: get("last_checked_at")?.parse::<i64>().ok(),
         })
     }
 
@@ -1553,6 +1741,10 @@ impl Store {
             max_agent_steps: max_steps,
             launch_at_login: parse_bool("launch_at_login", false)?,
             notifications_enabled: parse_bool("notifications_enabled", true)?,
+            agent_mode: match get("agent_mode")?.as_str() {
+                "verification" => "verification".to_string(),
+                _ => DEFAULT_AGENT_MODE.to_string(),
+            },
         })
     }
 
@@ -1578,6 +1770,9 @@ impl Store {
                 "max_agent_steps must be 2..8".into(),
             ));
         }
+        if !matches!(input.agent_mode.as_str(), "reflection" | "verification") {
+            return Err(StoreError::InvalidSetting("invalid agent mode".into()));
+        }
         for (key, value) in [
             ("agent_enabled", input.enabled.to_string()),
             ("codex_enabled", input.codex_enabled.to_string()),
@@ -1595,6 +1790,7 @@ impl Store {
                 "notifications_enabled",
                 input.notifications_enabled.to_string(),
             ),
+            ("agent_mode", input.agent_mode.clone()),
         ] {
             self.conn.execute(
                 "INSERT INTO config(key,value) VALUES (?1,?2)
@@ -1621,10 +1817,56 @@ impl Store {
         model: &str,
         context_mode: &str,
     ) -> Result<(), StoreError> {
+        self.save_config_with_provider(
+            DEFAULT_MODEL_PROVIDER,
+            base_url,
+            model,
+            context_mode,
+            DEFAULT_MODEL_TIMEOUT_SECONDS,
+        )
+    }
+
+    pub fn save_config_with_provider(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        context_mode: &str,
+        timeout_seconds: i64,
+    ) -> Result<(), StoreError> {
+        if !matches!(provider, "remote" | "ollama") {
+            return Err(StoreError::InvalidSetting("invalid model provider".into()));
+        }
+        if !(10..=300).contains(&timeout_seconds) {
+            return Err(StoreError::InvalidSetting(
+                "timeout_seconds must be 10..300".into(),
+            ));
+        }
+        let values = [
+            ("provider", provider.to_string()),
+            ("base_url", base_url.to_string()),
+            ("model", model.to_string()),
+            ("context_mode", context_mode.to_string()),
+            ("timeout_seconds", timeout_seconds.to_string()),
+        ];
+        for (key, value) in values {
+            self.conn.execute(
+                "INSERT INTO config(key,value) VALUES (?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_model_health(&self, status: &str, error: Option<&str>) -> Result<(), StoreError> {
         for (key, value) in [
-            ("base_url", base_url),
-            ("model", model),
-            ("context_mode", context_mode),
+            ("health_status", status.to_string()),
+            ("health_error", error.unwrap_or_default().to_string()),
+            (
+                "last_checked_at",
+                chrono::Utc::now().timestamp().to_string(),
+            ),
         ] {
             self.conn.execute(
                 "INSERT INTO config(key,value) VALUES (?1,?2)
@@ -1811,6 +2053,14 @@ fn read_evolution_run(row: &Row<'_>) -> rusqlite::Result<EvolutionRunState> {
         providers: serde_json::from_str(&providers_json).unwrap_or_default(),
         lookback_days: row.get(13)?,
         rolled_back_at: row.get(14)?,
+        agent_mode: row
+            .get::<_, Option<String>>(15)?
+            .unwrap_or_else(|| DEFAULT_AGENT_MODE.to_string()),
+        trace_count: row.get::<_, Option<i64>>(16)?.unwrap_or_default(),
+        verification_status: row
+            .get::<_, Option<String>>(17)?
+            .unwrap_or_else(|| "not_run".to_string()),
+        verification_summary: row.get(18)?,
     })
 }
 
@@ -1823,6 +2073,28 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusq
         }
     }
     Ok(false)
+}
+
+fn sanitize_export_paths(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains("/Users/") || text.contains("\\Users\\") || text.starts_with("file://")
+            {
+                *text = "[REDACTED_LOCAL_PATH]".to_string();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_export_paths(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                sanitize_export_paths(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1921,11 +2193,12 @@ mod tests {
         let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
         assert!(store.scan_cursor("source-1").unwrap().is_none());
         store
-            .save_scan_cursor("source-1", "codex", 120, 99)
+            .save_scan_cursor("source-1", "codex", 120, 99, 88)
             .unwrap();
         let cursor = store.scan_cursor("source-1").unwrap().unwrap();
         assert_eq!(cursor.size, 120);
         assert_eq!(cursor.modified_at, 99);
+        assert_eq!(cursor.oldest_activity_at, 88);
     }
 
     #[test]
@@ -1950,6 +2223,7 @@ mod tests {
             max_agent_steps: 4,
             launch_at_login: true,
             notifications_enabled: false,
+            agent_mode: "verification".into(),
         };
         let saved = store.save_evolution_settings(&input).unwrap();
         assert_eq!(saved.lookback_days, 7);
@@ -2027,6 +2301,39 @@ mod tests {
         assert_eq!(run.phase, "completed");
         assert_eq!(run.consumed_activities, 8);
         assert!(run.completed_at.is_some());
+    }
+
+    #[test]
+    fn agent_trace_summary_is_redacted_bounded_and_counted() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        store.start_evolution_run("run-trace", "manual").unwrap();
+        let secret = format!(
+            "api_key=super-secret-value /Users/private-user/project {}",
+            "x".repeat(700)
+        );
+        let saved = store
+            .append_trace_event(
+                "run-trace",
+                "analyzing",
+                "tool_call",
+                Some("read_activity_batch"),
+                &secret,
+                Some(12),
+                "ok",
+                None,
+            )
+            .unwrap();
+
+        assert!(saved.summary.contains("[REDACTED_API_KEY]"));
+        assert!(!saved.summary.contains("super-secret-value"));
+        assert!(!saved.summary.contains("private-user"));
+        assert!(saved.summary.chars().count() <= 500);
+        assert_eq!(store.list_trace_events("run-trace", 20).unwrap().len(), 1);
+        assert_eq!(
+            store.current_evolution_run().unwrap().unwrap().trace_count,
+            1
+        );
     }
 
     #[test]
@@ -2138,7 +2445,9 @@ mod tests {
         assert_eq!(run.providers, vec!["codex", "claude-code"]);
         assert_eq!(run.lookback_days, 7);
 
-        store.save_scan_cursor("cursor-1", "codex", 10, 20).unwrap();
+        store
+            .save_scan_cursor("cursor-1", "codex", 10, 20, 15)
+            .unwrap();
         store.record_source_scan("codex", 3).unwrap();
         let (last_scan, errors, cursors) = store.source_scan_health("codex").unwrap();
         assert!(last_scan.is_some());

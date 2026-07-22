@@ -8,10 +8,10 @@ mod watcher;
 
 use models::DEFAULT_CONTEXT_MODE;
 use models::{
-    CacheCleanupPreview, DashboardSnapshot, EntryVersion, EntryVersionDiff, EvolutionRunDetail,
-    EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult, McpInstallResult,
-    ReflectionConfigInput, ReflectionConfigView, ReflectionRunResult, RunRollbackResult,
-    ScanSummary, SourceSummary,
+    AgentTraceEvent, CacheCleanupPreview, DashboardSnapshot, EntryVersion, EntryVersionDiff,
+    EvolutionRunDetail, EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult,
+    McpInstallResult, ReflectionConfigInput, ReflectionConfigView, ReflectionRunResult,
+    RunRollbackResult, ScanSummary, SourceSummary,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -130,6 +130,12 @@ fn save_reflection_config(
     if !matches!(context_mode, "mcp" | "guided") {
         return Err("上下文模式必须是 mcp 或 guided".to_string());
     }
+    if !matches!(input.provider.as_str(), "remote" | "ollama") {
+        return Err("模型 Provider 必须是 remote 或 ollama".to_string());
+    }
+    if !(10..=300).contains(&input.timeout_seconds) {
+        return Err("模型超时必须在 10 到 300 秒之间".to_string());
+    }
     if let Some(api_key) = input
         .api_key
         .as_deref()
@@ -145,7 +151,16 @@ fn save_reflection_config(
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
     store
-        .save_config(input.base_url.trim(), input.model.trim(), context_mode)
+        .save_config_with_provider(
+            &input.provider,
+            input.base_url.trim(),
+            input.model.trim(),
+            context_mode,
+            input.timeout_seconds,
+        )
+        .map_err(|err| err.to_string())?;
+    store
+        .mark_model_health("unknown", None)
         .map_err(|err| err.to_string())?;
     store.config().map_err(|err| err.to_string())
 }
@@ -175,21 +190,55 @@ fn save_evolution_settings(
 }
 
 #[tauri::command]
-async fn test_model_connection(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let (base_url, model) = {
+async fn test_model_connection(
+    input: ReflectionConfigInput,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, CommandError> {
+    let api_key = input
+        .api_key
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            keyring::Entry::new("recall-evolution", "reflection-api")
+                .ok()
+                .and_then(|entry| entry.get_password().ok())
+                .unwrap_or_default()
+        });
+    {
         let store = state
             .store
             .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        store.load_config_values().map_err(|err| err.to_string())?
-    };
-    let api_key = keyring::Entry::new("recall-evolution", "reflection-api")
-        .map_err(|err| err.to_string())?
-        .get_password()
-        .unwrap_or_default();
-    reflection::test_connection(base_url, model, api_key)
-        .await
-        .map_err(|err| err.to_string())
+            .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
+        store
+            .mark_model_health("checking", None)
+            .map_err(CommandError::store)?;
+    }
+    let result =
+        reflection::test_connection(input.base_url, input.model, api_key, input.timeout_seconds)
+            .await;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
+    match result {
+        Ok(value) => {
+            store
+                .mark_model_health("ok", None)
+                .map_err(CommandError::store)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let code = reflection::error_code(&error);
+            store
+                .mark_model_health("error", Some(&error.to_string()))
+                .map_err(CommandError::store)?;
+            Err(CommandError::new(
+                code,
+                error.to_string(),
+                code == "network_error" || code == "timeout",
+            ))
+        }
+    }
 }
 
 #[tauri::command]
@@ -276,6 +325,20 @@ fn get_evolution_run_detail(
         .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
     store
         .evolution_run_detail(&run_id)
+        .map_err(CommandError::store)
+}
+
+#[tauri::command]
+fn get_evolution_run_trace(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<AgentTraceEvent>, CommandError> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
+    store
+        .list_trace_events(&run_id, 500)
         .map_err(CommandError::store)
 }
 
@@ -415,7 +478,7 @@ async fn execute_evolution_inner(
     cancel_requested: &Arc<AtomicBool>,
 ) -> Result<ReflectionRunResult, String> {
     let run_id = format!("run-{}", uuid::Uuid::new_v4());
-    let (settings, base_url, model) = {
+    let (settings, config) = {
         let store = store_ref
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
@@ -426,7 +489,7 @@ async fn execute_evolution_inner(
         if !settings.enabled {
             return Err("Evolution Agent 未启用".into());
         }
-        let (base_url, model) = store.load_config_values().map_err(|err| err.to_string())?;
+        let config = store.config().map_err(|err| err.to_string())?;
         let providers = [
             settings.codex_enabled.then_some("codex".to_string()),
             settings.claude_enabled.then_some("claude-code".to_string()),
@@ -435,20 +498,35 @@ async fn execute_evolution_inner(
         .flatten()
         .collect::<Vec<_>>();
         store
-            .start_evolution_run_with_context(
+            .start_evolution_run_with_agent_context(
                 &run_id,
                 &settings.run_mode,
-                (!model.trim().is_empty()).then_some(model.as_str()),
+                &settings.agent_mode,
+                (!config.model.trim().is_empty()).then_some(config.model.as_str()),
                 &providers,
                 settings.lookback_days,
             )
             .map_err(|err| err.to_string())?;
-        (settings, base_url, model)
+        (settings, config)
     };
+    emit_trace_update(
+        app,
+        store_ref,
+        &run_id,
+        reflection::TraceEvent {
+            phase: "scanning".into(),
+            event_type: "phase_started".into(),
+            tool_name: None,
+            summary: "开始扫描 Codex 与 Claude Code 会话".into(),
+            duration_ms: None,
+            result_status: "running".into(),
+            error_code: None,
+        },
+    );
     emit_run_state(app, store_ref);
     check_cancelled(app, store_ref, cancel_requested, &run_id)?;
 
-    let (activities, active_entries, scanned_activities) = {
+    let prepared = (|| -> Result<_, String> {
         let store = store_ref
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
@@ -464,7 +542,11 @@ async fn execute_evolution_inner(
             settings.claude_enabled,
             settings.listen_since,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string());
+        let scan = match scan {
+            Ok(scan) => scan,
+            Err(error) => return Err(error),
+        };
         store
             .update_evolution_run(
                 &run_id,
@@ -484,8 +566,48 @@ async fn execute_evolution_inner(
             .set_evolution_run_activities(&run_id, &activities)
             .map_err(|err| err.to_string())?;
         let active_entries = store.list_entries().map_err(|err| err.to_string())?;
-        (activities, active_entries, scan.scanned_activities)
+        Ok((activities, active_entries, scan.scanned_activities))
+    })();
+    let (activities, active_entries, scanned_activities) = match prepared {
+        Ok(value) => value,
+        Err(message) => {
+            emit_trace_update(
+                app,
+                store_ref,
+                &run_id,
+                reflection::TraceEvent {
+                    phase: "scanning".into(),
+                    event_type: "run_failed".into(),
+                    tool_name: None,
+                    summary: message.clone(),
+                    duration_ms: None,
+                    result_status: "error".into(),
+                    error_code: Some("scan_error".into()),
+                },
+            );
+            if let Ok(store) = store_ref.lock() {
+                let _ =
+                    store.update_evolution_run(&run_id, "failed", 0, 0, 0, 0, 0, Some(&message));
+            }
+            emit_run_state(app, store_ref);
+            notify_run(app, store_ref, "Evolution Agent 扫描失败", &message);
+            return Err(message);
+        }
     };
+    emit_trace_update(
+        app,
+        store_ref,
+        &run_id,
+        reflection::TraceEvent {
+            phase: "reading".into(),
+            event_type: "activity_batch_ready".into(),
+            tool_name: None,
+            summary: format!("固定读取 {} 条脱敏活动", activities.len()),
+            duration_ms: None,
+            result_status: "ok".into(),
+            error_code: None,
+        },
+    );
     emit_run_state(app, store_ref);
     check_cancelled(app, store_ref, cancel_requested, &run_id)?;
 
@@ -498,6 +620,20 @@ async fn execute_evolution_inner(
             .update_evolution_run(&run_id, "completed", scanned_activities, 0, 0, 0, 0, None)
             .map_err(|err| err.to_string())?;
         drop(store);
+        emit_trace_update(
+            app,
+            store_ref,
+            &run_id,
+            reflection::TraceEvent {
+                phase: "completed".into(),
+                event_type: "run_completed".into(),
+                tool_name: None,
+                summary: "没有新的脱敏活动，运行未调用模型".into(),
+                duration_ms: None,
+                result_status: "ok".into(),
+                error_code: None,
+            },
+        );
         emit_run_state(app, store_ref);
         return Ok(ReflectionRunResult {
             run_id,
@@ -506,6 +642,8 @@ async fn execute_evolution_inner(
             pending: 0,
             discarded: 0,
             message: "没有新的脱敏活动".into(),
+            verification_status: "not_run".into(),
+            verification_summary: None,
         });
     }
     let api_key = keyring::Entry::new("recall-evolution", "reflection-api")
@@ -521,14 +659,23 @@ async fn execute_evolution_inner(
             .map_err(|e| e.to_string())?;
     }
     emit_run_state(app, store_ref);
+    let trace_sink: reflection::TraceSink = {
+        let trace_app = app.clone();
+        let trace_store = store_ref.clone();
+        let trace_run_id = run_id.clone();
+        Arc::new(move |event| emit_trace_update(&trace_app, &trace_store, &trace_run_id, event))
+    };
     let generation = reflection::generate_agent(
-        base_url,
-        model,
+        config.base_url.clone(),
+        config.model.clone(),
         api_key,
         activities,
         active_entries,
         settings.max_agent_steps,
+        &settings.agent_mode,
+        config.timeout_seconds,
         &run_id,
+        trace_sink,
     );
     let mut result = match tokio::select! {
         value = generation => Some(value),
@@ -537,9 +684,25 @@ async fn execute_evolution_inner(
         None => return cancel_run(app, store_ref, &run_id),
         Some(Ok(value)) => value,
         Some(Err(err)) => {
+            let code = reflection::error_code(&err);
+            emit_trace_update(
+                app,
+                store_ref,
+                &run_id,
+                reflection::TraceEvent {
+                    phase: "analyzing".into(),
+                    event_type: "run_failed".into(),
+                    tool_name: None,
+                    summary: err.to_string(),
+                    duration_ms: None,
+                    result_status: "error".into(),
+                    error_code: Some(code.into()),
+                },
+            );
             let store = store_ref
                 .lock()
                 .map_err(|_| "store lock poisoned".to_string())?;
+            let _ = store.mark_model_health("error", Some(&err.to_string()));
             store
                 .update_evolution_run(
                     &run_id,
@@ -558,6 +721,35 @@ async fn execute_evolution_inner(
             return Err(err.to_string());
         }
     };
+    {
+        let store = store_ref
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let _ = store.mark_model_health("ok", None);
+        store
+            .set_run_verification(
+                &run_id,
+                &result.verification_status,
+                result.verification_summary.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(summary) = result.verification_summary.as_deref() {
+        emit_trace_update(
+            app,
+            store_ref,
+            &run_id,
+            reflection::TraceEvent {
+                phase: "validating".into(),
+                event_type: "verification_result".into(),
+                tool_name: None,
+                summary: summary.to_string(),
+                duration_ms: None,
+                result_status: result.verification_status.clone(),
+                error_code: None,
+            },
+        );
+    }
     {
         let store = store_ref
             .lock()
@@ -589,6 +781,20 @@ async fn execute_evolution_inner(
     };
     if let Err(err) = validation {
         let message = err.to_string();
+        emit_trace_update(
+            app,
+            store_ref,
+            &run_id,
+            reflection::TraceEvent {
+                phase: "validating".into(),
+                event_type: "risk_gate_failed".into(),
+                tool_name: None,
+                summary: message.clone(),
+                duration_ms: None,
+                result_status: "error".into(),
+                error_code: Some("validation_error".into()),
+            },
+        );
         let store = store_ref
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
@@ -609,6 +815,23 @@ async fn execute_evolution_inner(
         notify_run(app, store_ref, "Evolution Agent 校验失败", &message);
         return Err(message);
     }
+    emit_trace_update(
+        app,
+        store_ref,
+        &run_id,
+        reflection::TraceEvent {
+            phase: "validating".into(),
+            event_type: "risk_gate_completed".into(),
+            tool_name: None,
+            summary: format!(
+                "风险门完成：{} 条自动启用，{} 条进入审核",
+                result.activated, result.pending
+            ),
+            duration_ms: None,
+            result_status: "ok".into(),
+            error_code: None,
+        },
+    );
     {
         let store = store_ref
             .lock()
@@ -636,6 +859,20 @@ async fn execute_evolution_inner(
     };
     if let Err(err) = persistence {
         let message = err.to_string();
+        emit_trace_update(
+            app,
+            store_ref,
+            &run_id,
+            reflection::TraceEvent {
+                phase: "persisting".into(),
+                event_type: "persistence_failed".into(),
+                tool_name: None,
+                summary: message.clone(),
+                duration_ms: None,
+                result_status: "error".into(),
+                error_code: Some("store_error".into()),
+            },
+        );
         let store = store_ref
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
@@ -657,6 +894,20 @@ async fn execute_evolution_inner(
         return Err(message);
     }
     emit_run_state(app, store_ref);
+    emit_trace_update(
+        app,
+        store_ref,
+        &run_id,
+        reflection::TraceEvent {
+            phase: "completed".into(),
+            event_type: "run_completed".into(),
+            tool_name: None,
+            summary: format!("运行完成：生成 {} 条候选", result.generated.len()),
+            duration_ms: None,
+            result_status: "ok".into(),
+            error_code: None,
+        },
+    );
     if result.pending > 0 {
         notify_run(
             app,
@@ -711,6 +962,20 @@ fn cancel_run<T>(
     store_ref: &Arc<Mutex<Store>>,
     run_id: &str,
 ) -> Result<T, String> {
+    emit_trace_update(
+        app,
+        store_ref,
+        run_id,
+        reflection::TraceEvent {
+            phase: "cancelled".into(),
+            event_type: "run_cancelled".into(),
+            tool_name: None,
+            summary: "运行已取消，活动未消费".into(),
+            duration_ms: None,
+            result_status: "cancelled".into(),
+            error_code: Some("cancelled".into()),
+        },
+    );
     let store = store_ref
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
@@ -747,6 +1012,28 @@ fn emit_run_state(app: &AppHandle, store_ref: &Arc<Mutex<Store>>) {
     if let Ok(store) = store_ref.lock() {
         if let Ok(Some(run)) = store.current_evolution_run() {
             let _ = app.emit("evolution-state", run);
+        }
+    }
+}
+
+fn emit_trace_update(
+    app: &AppHandle,
+    store_ref: &Arc<Mutex<Store>>,
+    run_id: &str,
+    event: reflection::TraceEvent,
+) {
+    if let Ok(store) = store_ref.lock() {
+        if let Ok(saved) = store.append_trace_event(
+            run_id,
+            &event.phase,
+            &event.event_type,
+            event.tool_name.as_deref(),
+            &event.summary,
+            event.duration_ms,
+            &event.result_status,
+            event.error_code.as_deref(),
+        ) {
+            let _ = app.emit("evolution-trace", saved);
         }
     }
 }
@@ -1073,6 +1360,7 @@ pub fn run() {
             review_entry,
             list_entry_versions,
             get_evolution_run_detail,
+            get_evolution_run_trace,
             get_entry_version_diff,
             rollback_entry,
             rollback_evolution_run,

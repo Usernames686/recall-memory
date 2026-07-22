@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONTEXT_MODE: &str = "guided";
+pub const DEFAULT_AGENT_MODE: &str = "reflection";
+pub const DEFAULT_MODEL_PROVIDER: &str = "remote";
+pub const DEFAULT_MODEL_TIMEOUT_SECONDS: i64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,20 +121,37 @@ pub struct McpStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReflectionConfigView {
+    pub provider: String,
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
     pub context_mode: String,
+    pub timeout_seconds: i64,
+    pub health_status: String,
+    pub health_error: Option<String>,
+    pub last_checked_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReflectionConfigInput {
+    #[serde(default = "default_model_provider")]
+    pub provider: String,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
     #[serde(default)]
     pub context_mode: Option<String>,
+    #[serde(default = "default_model_timeout_seconds")]
+    pub timeout_seconds: i64,
+}
+
+fn default_model_provider() -> String {
+    DEFAULT_MODEL_PROVIDER.to_string()
+}
+
+fn default_model_timeout_seconds() -> i64 {
+    DEFAULT_MODEL_TIMEOUT_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +163,10 @@ pub struct ReflectionRunResult {
     pub pending: i64,
     pub discarded: i64,
     pub message: String,
+    #[serde(default)]
+    pub verification_status: String,
+    #[serde(default)]
+    pub verification_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +183,7 @@ pub struct EvolutionSettingsView {
     pub max_agent_steps: i64,
     pub launch_at_login: bool,
     pub notifications_enabled: bool,
+    pub agent_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,10 +202,16 @@ pub struct EvolutionSettingsInput {
     pub launch_at_login: bool,
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_agent_mode() -> String {
+    DEFAULT_AGENT_MODE.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +236,29 @@ pub struct EvolutionRunState {
     pub lookback_days: i64,
     #[serde(default)]
     pub rolled_back_at: Option<i64>,
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
+    #[serde(default)]
+    pub trace_count: i64,
+    #[serde(default)]
+    pub verification_status: String,
+    #[serde(default)]
+    pub verification_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTraceEvent {
+    pub id: i64,
+    pub run_id: String,
+    pub occurred_at: i64,
+    pub phase: String,
+    pub event_type: String,
+    pub tool_name: Option<String>,
+    pub summary: String,
+    pub duration_ms: Option<i64>,
+    pub result_status: String,
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +267,7 @@ pub struct EvolutionRunDetail {
     pub run: EvolutionRunState,
     pub activities: Vec<Activity>,
     pub entries: Vec<EvolutionEntry>,
+    pub traces: Vec<AgentTraceEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,13 +394,4 @@ pub struct McpInstallResult {
     pub claude_config: String,
     pub backups: Vec<String>,
     pub sidecar_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CandidateInput {
-    pub kind: String,
-    pub title: String,
-    pub summary: String,
-    pub body: String,
-    pub source_refs: Vec<String>,
 }
