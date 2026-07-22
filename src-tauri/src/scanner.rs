@@ -6,6 +6,8 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::File;
+#[cfg(test)]
+use std::io::Cursor;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -129,6 +131,26 @@ pub fn scan_sources_with_options(
     }
     summary.sources.push(claude_source);
     Ok(summary)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_codex_fixture(input: &str) -> Result<Vec<Activity>, String> {
+    parse_codex(
+        "codex",
+        Path::new("codex-fixture.jsonl"),
+        Cursor::new(input),
+    )
+    .map(|parsed| parsed.activities)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_claude_fixture(input: &str) -> Result<Vec<Activity>, String> {
+    parse_claude(
+        "claude-code",
+        Path::new("claude-fixture.jsonl"),
+        Cursor::new(input),
+    )
+    .map(|parsed| parsed.activities)
 }
 
 fn scan_directory(

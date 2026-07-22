@@ -1,0 +1,3 @@
+{"type":"session_meta","timestamp":"2026-07-22T01:00:00Z","payload":{"id":"codex-fixture-session","cwd":"/Users/demo/project"}}
+{"type":"event_msg","timestamp":"2026-07-22T01:01:00Z","payload":{"type":"user_message","message":"Please make the verification workflow repeatable."}}
+{"type":"event_msg","timestamp":"2026-07-22T01:02:00Z","payload":{"type":"agent_message","message":"Run focused checks, record evidence, then run the full build."}}

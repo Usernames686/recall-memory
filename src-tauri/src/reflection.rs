@@ -221,12 +221,15 @@ impl Tool for ReadContextTool {
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.called.store(true, Ordering::Release);
+        let active_count = serde_json::from_str::<Vec<Value>>(&self.context)
+            .map(|entries| entries.len())
+            .unwrap_or_default();
         emit_trace(
             &self.trace,
             "analyzing",
             "tool_call",
             Some(Self::NAME),
-            "读取当前 Active Meta/Skill 上下文",
+            &format!("读取当前 Active Meta/Skill 上下文（{active_count} 条）"),
         );
         Ok(self.context.clone())
     }
@@ -1716,6 +1719,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_openai_full_store_mcp_flow_persists_and_exposes_approved_context() {
+        use crate::mcp::handle_request;
+        use serde_json::Value;
+
+        let (base_url, server) = spawn_mock_server(MockMode::Verification).await;
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let activity = fixture_activity();
+        store.upsert_activity(&activity).unwrap();
+        let run_id = "run-mock-full";
+        store
+            .start_evolution_run_with_agent_context(
+                run_id,
+                "manual",
+                "verification",
+                Some("mock-model"),
+                &["codex".to_string()],
+                30,
+            )
+            .unwrap();
+        store
+            .set_evolution_run_activities(run_id, std::slice::from_ref(&activity))
+            .unwrap();
+        let mut result = generate_agent(
+            "ollama",
+            base_url,
+            "mock-model".into(),
+            String::new(),
+            vec![activity.clone()],
+            Vec::new(),
+            8,
+            "verification",
+            10,
+            false,
+            String::new(),
+            String::new(),
+            10,
+            0.0,
+            0.0,
+            run_id,
+            silent_trace(),
+        )
+        .await
+        .unwrap();
+        validate_risk_gate_with_policy(&store, &mut result, false).unwrap();
+        store.set_run_model_usage(run_id, &result).unwrap();
+        store
+            .set_run_verification(
+                run_id,
+                &result.verification_status,
+                result.verification_summary.as_deref(),
+            )
+            .unwrap();
+        store
+            .persist_evolution_result(run_id, &result, &[activity.id.clone()], 1)
+            .unwrap();
+        let candidate_id = result.generated[0].id.clone();
+        store
+            .set_entry_status_with_reason(&candidate_id, "active", "mock acceptance")
+            .unwrap();
+        let response = handle_request(
+            &store,
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"evolution_context","arguments":{"action":"meta"}
+                }
+            }),
+        );
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        let active = store
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == candidate_id)
+            .unwrap();
+        assert_eq!(active.status, "active");
+        assert!(payload
+            .get("context_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains(&active.title));
+        let status = handle_request(
+            &store,
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"evolution_run_status","arguments":{"limit":10}
+                }
+            }),
+        );
+        assert!(status.to_string().contains("run-mock-full"));
+        assert!(status.to_string().contains("completed"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn mock_openai_errors_fail_closed_without_consuming_candidates() {
         for (status, expected) in [
             (401, "unauthorized"),
@@ -1815,6 +1917,192 @@ mod tests {
         assert_eq!(result.fallback_count, 0);
         assert_eq!(result.verification_status, "passed");
         assert!(!result.generated.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real tool-calling OpenAI-compatible endpoint and credentials"]
+    async fn real_openai_compatible_model_completes_full_verified_store_mcp_flow() {
+        use crate::mcp::handle_request;
+        use crate::scanner::{parse_claude_fixture, parse_codex_fixture};
+        use serde_json::Value;
+
+        let base_url =
+            std::env::var("RECALL_REAL_MODEL_BASE_URL").expect("set RECALL_REAL_MODEL_BASE_URL");
+        let model = std::env::var("RECALL_REAL_MODEL_ID").expect("set RECALL_REAL_MODEL_ID");
+        let api_key =
+            std::env::var("RECALL_REAL_MODEL_API_KEY").expect("set RECALL_REAL_MODEL_API_KEY");
+        let dir = tempdir().expect("temporary acceptance store");
+        let store = Store::open(dir.path().join("store.sqlite3")).expect("open acceptance store");
+        store.set_consent(true).expect("grant fixture consent");
+
+        let mut activities = parse_codex_fixture(include_str!("../fixtures/codex_redacted.jsonl"))
+            .expect("parse Codex redacted fixture");
+        activities.extend(
+            parse_claude_fixture(include_str!("../fixtures/claude_redacted.jsonl"))
+                .expect("parse Claude Code redacted fixture"),
+        );
+        assert!(
+            activities.len() >= 4,
+            "fixtures must produce a useful activity batch"
+        );
+        store
+            .upsert_activities(&activities)
+            .expect("persist redacted fixture activities");
+        let run_id = "run-real-model-full";
+        store
+            .start_evolution_run_with_agent_context(
+                run_id,
+                "manual",
+                "verification",
+                Some(&model),
+                &["codex".to_string(), "claude-code".to_string()],
+                30,
+            )
+            .expect("start acceptance run");
+        store
+            .set_evolution_run_activities(run_id, &activities)
+            .expect("freeze acceptance activity batch");
+
+        let mut result = generate_agent(
+            "remote",
+            base_url.clone(),
+            model.clone(),
+            api_key.clone(),
+            activities.clone(),
+            store.list_entries().expect("read initial active context"),
+            8,
+            "verification",
+            120,
+            false,
+            String::new(),
+            String::new(),
+            120,
+            1.0,
+            1.0,
+            run_id,
+            silent_trace(),
+        )
+        .await
+        .expect("real model must complete the restricted tool flow");
+        assert_eq!(result.provider_used, "remote");
+        assert_eq!(result.fallback_count, 0);
+        assert_eq!(result.verification_status, "passed");
+        assert!(
+            !result.generated.is_empty(),
+            "real model produced no candidate"
+        );
+
+        validate_risk_gate_with_policy(&store, &mut result, false)
+            .expect("local risk gate should classify candidates");
+        store
+            .set_run_model_usage(run_id, &result)
+            .expect("persist model usage");
+        store
+            .set_run_verification(
+                run_id,
+                &result.verification_status,
+                result.verification_summary.as_deref(),
+            )
+            .expect("persist verification summary");
+        let activity_ids = activities
+            .iter()
+            .map(|activity| activity.id.clone())
+            .collect::<Vec<_>>();
+        store
+            .persist_evolution_result(run_id, &result, &activity_ids, activities.len() as i64)
+            .expect("persist candidates and consume activity transactionally");
+        let candidate_id = result.generated[0].id.clone();
+        assert_eq!(
+            store.pending_count().expect("pending count"),
+            result.generated.len() as i64
+        );
+        assert_eq!(store.dirty_count().expect("dirty count"), 0);
+
+        store
+            .set_entry_status_with_reason(&candidate_id, "active", "real model acceptance")
+            .expect("approve candidate");
+        let active = store
+            .list_entries()
+            .expect("read active store")
+            .into_iter()
+            .find(|entry| entry.id == candidate_id)
+            .expect("approved candidate exists");
+        assert_eq!(active.status, "active");
+
+        let context_response = handle_request(
+            &store,
+            &serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"evolution_context","arguments":{"action":"meta"}}
+            }),
+        );
+        let context_text = context_response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .expect("MCP context response");
+        let context: Value = serde_json::from_str(context_text).expect("MCP context JSON");
+        let rendered_context = context
+            .get("context_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(rendered_context.contains(&active.title));
+        assert!(
+            rendered_context.contains(&active.summary) || rendered_context.contains(&active.body)
+        );
+
+        let status_response = handle_request(
+            &store,
+            &serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name":"evolution_run_status","arguments":{"limit":20}}
+            }),
+        );
+        assert!(status_response.to_string().contains("run-real-model-full"));
+        assert!(status_response.to_string().contains("completed"));
+
+        let next_context = store.list_entries().expect("read next-round context");
+        assert!(next_context.iter().any(|entry| entry.id == candidate_id));
+        let next_context_summaries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let next_context_summaries_sink = next_context_summaries.clone();
+        let next_trace: TraceSink = Arc::new(move |event| {
+            if event.tool_name.as_deref() == Some("read_current_context") {
+                next_context_summaries_sink
+                    .lock()
+                    .unwrap()
+                    .push(event.summary);
+            }
+        });
+        let next_round = generate_agent(
+            "remote",
+            base_url,
+            model,
+            api_key,
+            vec![activities[0].clone()],
+            next_context,
+            8,
+            "reflection",
+            120,
+            false,
+            String::new(),
+            String::new(),
+            120,
+            1.0,
+            1.0,
+            "run-real-model-next",
+            next_trace,
+        )
+        .await
+        .expect("next round must complete after reading the approved context");
+        assert!(next_round.generated.len() <= 4);
+        assert!(next_context_summaries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|summary| summary.contains("1 条")));
     }
 
     #[tokio::test]

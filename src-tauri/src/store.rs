@@ -31,6 +31,7 @@ pub enum StoreError {
 pub struct Store {
     conn: Connection,
     path: std::path::PathBuf,
+    read_only: bool,
 }
 
 const CURRENT_SCHEMA_VERSION: i64 = 4;
@@ -223,7 +224,30 @@ impl Store {
             ",
         )?;
         run_migrations(&mut conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            read_only: false,
+        })
+    }
+
+    /// Open an existing Store for read-only consumers such as the MCP sidecar.
+    ///
+    /// This deliberately skips directory creation, schema setup, WAL changes,
+    /// and migrations. A sidecar must never create or mutate the Active Store
+    /// merely because a client asked for context.
+    pub fn open_read_only(path: std::path::PathBuf) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_millis(3_000))?;
+        Ok(Self {
+            conn,
+            path,
+            read_only: true,
+        })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn path(&self) -> &Path {

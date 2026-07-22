@@ -27,7 +27,7 @@ pub fn run_stdio() -> Result<(), McpError> {
     let store_path = std::env::var_os("RECALL_STORE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(paths::store_path);
-    let store = Store::open(store_path)?;
+    let store = Store::open_read_only(store_path)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -63,7 +63,7 @@ pub fn handle_request(store: &Store, request: &Value) -> Value {
         "tools/call" => call_tool(store, request.get("params").unwrap_or(&Value::Null)),
         _ => Err(format!("unsupported method: {method}")),
     };
-    if method == "tools/call" {
+    if method == "tools/call" && !store.is_read_only() {
         let name = request
             .pointer("/params/name")
             .and_then(Value::as_str)
@@ -702,6 +702,44 @@ mod tests {
         );
         assert!(response.to_string().contains("read_activity_batch"));
         assert_eq!(store.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_only_store_serves_context_without_mutating_the_active_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let store = Store::open(path.clone()).unwrap();
+        store
+            .insert_entry(&EvolutionEntry {
+                id: "active-1".into(),
+                kind: "meta".into(),
+                title: "Read only context".into(),
+                summary: "MCP must not write Active Store".into(),
+                body: "Only expose approved content.".into(),
+                status: "active".into(),
+                risk: "low".into(),
+                source_refs: vec![],
+                updated_at: 1,
+                origin_run_id: None,
+                target_entry_id: None,
+                version: 1,
+            })
+            .unwrap();
+        let before_calls = store.recent_mcp_calls(20).unwrap().len();
+        let read_only = Store::open_read_only(path).unwrap();
+        let response = handle_request(
+            &read_only,
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"evolution_context","arguments":{"action":"meta"}
+                }
+            }),
+        );
+        assert!(response.to_string().contains("Read only context"));
+        assert!(read_only
+            .append_mcp_call("evolution_context", Some("meta"), "ok")
+            .is_err());
+        assert_eq!(store.recent_mcp_calls(20).unwrap().len(), before_calls);
     }
 
     #[test]

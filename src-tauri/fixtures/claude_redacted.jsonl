@@ -1,0 +1,3 @@
+{"type":"system","sessionId":"claude-fixture-session","message":{"role":"system","content":"internal metadata"}}
+{"type":"user","sessionId":"claude-fixture-session","message":{"role":"user","content":"Please make the verification workflow repeatable."}}
+{"type":"assistant","sessionId":"claude-fixture-session","message":{"role":"assistant","content":"Run focused checks, record evidence, then run the full build."}}

@@ -30,7 +30,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm test:e2e
       - run: pnpm tauri:build:universal
       - name: Verify universal artifacts
         run: |
@@ -38,12 +45,15 @@ jobs:
           lipo -info "$APP/Contents/MacOS/recall-evolution"
           lipo -info "$APP/Contents/MacOS/evolution-mcp"
           codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --display --verbose=4 "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
       - name: Notarize and staple
         run: |
           DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -print -quit)
           xcrun notarytool submit "$DMG" --wait --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
+          hdiutil verify "$DMG"
       - uses: softprops/action-gh-release@v2
         with:
           files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg

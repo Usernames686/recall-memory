@@ -14,12 +14,15 @@ pnpm test:real-model
 ```
 
 The model must support OpenAI-compatible tool calls and return the restricted
-sequence for verification mode. The test asserts that the provider completes
-the context/activity read, candidate proposal, candidate-level verification,
-and structured finish protocol without fallback.
+sequence for verification mode. `pnpm test:real-model` creates a temporary
+SQLite Store, parses the checked-in redacted Codex and Claude Code JSONL
+fixtures, runs candidate-level verification, persists the candidate and
+consumed activity batch, approves one candidate, and calls both read-only MCP
+tools. It also asserts that the approved content is present in the context
+exposed to the next round. The run must complete without fallback.
 
-For the full product acceptance, use the same endpoint in Settings, scan a
-redacted Codex or Claude Code fixture, run verification mode, approve the
-candidate in the Review page, and call both read-only MCP tools. Record the
-run id and provider in the release checklist; never record the API key or raw
+For the desktop product acceptance, use the same endpoint in Settings, scan a
+redacted Codex or Claude Code session, run verification mode, approve the
+candidate in the Review page, and call both read-only MCP tools. Record the run
+id and provider in the release checklist; never record the API key or raw
 session text.

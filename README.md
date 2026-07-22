@@ -53,4 +53,10 @@ The real remote tool-calling acceptance test is opt-in and documented in
 [`REAL_MODEL_E2E.md`](REAL_MODEL_E2E.md). It reads credentials only from
 environment variables and is excluded from the default test suite.
 
+The acceptance command exercises the full temporary-Store flow, including
+redacted Codex and Claude Code fixtures, candidate approval, the two read-only
+MCP tools, and the next-round Active context. It requires a real endpoint and
+will fail clearly when `RECALL_REAL_MODEL_BASE_URL`, `RECALL_REAL_MODEL_ID`, or
+`RECALL_REAL_MODEL_API_KEY` is not configured.
+
 The generated macOS app and DMG are build artifacts and are intentionally excluded from Git by `.gitignore`.
