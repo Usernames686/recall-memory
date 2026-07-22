@@ -63,7 +63,7 @@ pub fn handle_request(store: &Store, request: &Value) -> Value {
         "tools/call" => call_tool(store, request.get("params").unwrap_or(&Value::Null)),
         _ => Err(format!("unsupported method: {method}")),
     };
-    if method == "tools/call" && !store.is_read_only() {
+    if method == "tools/call" {
         let name = request
             .pointer("/params/name")
             .and_then(Value::as_str)
@@ -72,7 +72,11 @@ pub fn handle_request(store: &Store, request: &Value) -> Value {
             .pointer("/params/arguments/action")
             .and_then(Value::as_str);
         let status = if result.is_ok() { "ok" } else { "error" };
-        let _ = store.append_mcp_call(name, action, status);
+        if store.is_read_only() {
+            let _ = store.append_mcp_telemetry(name, action, status);
+        } else {
+            let _ = store.append_mcp_call(name, action, status);
+        }
     }
     match result {
         Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
@@ -739,7 +743,9 @@ mod tests {
         assert!(read_only
             .append_mcp_call("evolution_context", Some("meta"), "ok")
             .is_err());
-        assert_eq!(store.recent_mcp_calls(20).unwrap().len(), before_calls);
+        let calls = store.recent_mcp_calls(20).unwrap();
+        assert_eq!(calls.len(), before_calls + 1);
+        assert_eq!(calls[0].tool_name, "evolution_context");
     }
 
     #[test]

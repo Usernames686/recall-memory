@@ -13,6 +13,7 @@ use regex::Regex;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -591,12 +592,41 @@ impl Store {
         Ok(())
     }
 
+    /// Keep sidecar telemetry outside the Active Store so MCP can remain
+    /// read-only while the desktop UI still shows recent call summaries.
+    pub fn append_mcp_telemetry(
+        &self,
+        tool_name: &str,
+        action: Option<&str>,
+        result_status: &str,
+    ) -> Result<(), StoreError> {
+        let path = self.mcp_telemetry_path();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let record = serde_json::json!({
+            "occurred_at": chrono::Utc::now().timestamp(),
+            "tool_name": crate::scanner::redact(tool_name),
+            "action": action.map(crate::scanner::redact),
+            "result_status": crate::scanner::redact(result_status)
+        });
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        restrict_file_permissions(&path)?;
+        Ok(())
+    }
+
+    pub fn mcp_telemetry_path(&self) -> std::path::PathBuf {
+        self.path.with_extension("mcp-calls.jsonl")
+    }
+
     pub fn recent_mcp_calls(&self, limit: i64) -> Result<Vec<McpCallSummary>, StoreError> {
+        let limit = limit.clamp(1, 1000) as usize;
         let mut stmt = self.conn.prepare(
             "SELECT id, occurred_at, tool_name, action, result_status
              FROM mcp_call_log ORDER BY occurred_at DESC, id DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map([limit.clamp(1, 100)], |row| {
+        let rows = stmt.query_map([limit as i64], |row| {
             Ok(McpCallSummary {
                 id: row.get(0)?,
                 occurred_at: row.get(1)?,
@@ -605,7 +635,45 @@ impl Store {
                 result_status: row.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        let mut calls = rows.filter_map(Result::ok).collect::<Vec<_>>();
+        if let Ok(file) = fs::File::open(self.mcp_telemetry_path()) {
+            for (index, line) in BufReader::new(file).lines().enumerate() {
+                let Ok(line) = line else { continue };
+                let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let Some(occurred_at) = record.get("occurred_at").and_then(|value| value.as_i64())
+                else {
+                    continue;
+                };
+                calls.push(McpCallSummary {
+                    id: -((index as i64) + 1),
+                    occurred_at,
+                    tool_name: record
+                        .get("tool_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    action: record
+                        .get("action")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                    result_status: record
+                        .get("result_status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                });
+            }
+        }
+        calls.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        calls.truncate(limit);
+        Ok(calls)
     }
 
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>, StoreError> {
