@@ -807,11 +807,28 @@ pub async fn test_connection(
         .json(&serde_json::json!({
             "model": model,
             "temperature": 0,
-            "max_tokens": 1,
+            "max_tokens": 64,
             "messages": [
-                {"role":"system","content":"Reply with OK."},
-                {"role":"user","content":"Connection test"}
-            ]
+                {"role":"system","content":"Call recall_connection_check with ok=true. Do not answer with text."},
+                {"role":"user","content":"Verify tool-calling compatibility."}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "recall_connection_check",
+                    "description": "Confirm that this model supports OpenAI-compatible function tools.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "recall_connection_check"}
+            }
         }))
         .send()
         .await
@@ -821,9 +838,17 @@ pub async fn test_connection(
         .text()
         .await
         .map_err(|err| ReflectionError::Request(err.to_string()))?;
-    let body: Value = serde_json::from_str(&body_text).unwrap_or_else(
-        |_| serde_json::json!({"body": body_text.chars().take(500).collect::<String>()}),
-    );
+    let body: Value = match serde_json::from_str(&body_text) {
+        Ok(body) => body,
+        Err(_) if !status.is_success() => {
+            serde_json::json!({"body": body_text.chars().take(500).collect::<String>()})
+        }
+        Err(_) => {
+            return Err(ReflectionError::InvalidResponse(
+                "模型连接返回了非法 JSON，无法确认 tool-calling 能力".into(),
+            ));
+        }
+    };
     if !status.is_success() {
         return Err(ReflectionError::Request(format!(
             "HTTP {}: {}",
@@ -831,7 +856,34 @@ pub async fn test_connection(
             truncate_json(&body)
         )));
     }
-    Ok(serde_json::json!({"ok":true,"model":model,"status":status.as_u16()}))
+    let compatible = body
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls.iter().any(|call| {
+                call.pointer("/function/name").and_then(Value::as_str)
+                    == Some("recall_connection_check")
+                    && call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                        .and_then(|arguments| arguments.get("ok").and_then(Value::as_bool))
+                        == Some(true)
+            })
+        })
+        .unwrap_or(false);
+    if !compatible {
+        return Err(ReflectionError::InvalidResponse(
+            "模型接口可访问，但未完成要求的 tool call；请选择支持 OpenAI-compatible tools 的模型"
+                .into(),
+        ));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "model": model,
+        "status": status.as_u16(),
+        "toolCalling": true
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1535,15 +1587,16 @@ const AGENT_SYSTEM_PROMPT: &str = r#"You are Recall's restricted Evolution Agent
 mod tests {
     use super::{
         anonymous_local_model, apply_risk_gate, chat_endpoint, error_code, estimate_cost_usd,
-        generate_agent, semantic_duplicate, should_try_ollama_fallback, token_similarity,
-        validate_action, validate_base_url, validate_risk_gate_with_policy, verify_entries,
-        FinishRunArgs, FinishRunTool, FinishVerificationTool, ModelCandidateVerification,
-        ReflectionAction, ReflectionError, RunCompletion, TraceSink, VerificationToolArgs,
+        generate_agent, semantic_duplicate, should_try_ollama_fallback, test_connection,
+        token_similarity, validate_action, validate_base_url, validate_risk_gate_with_policy,
+        verify_entries, FinishRunArgs, FinishRunTool, FinishVerificationTool,
+        ModelCandidateVerification, ReflectionAction, ReflectionError, RunCompletion, TraceSink,
+        VerificationToolArgs,
     };
     use crate::models::{Activity, EvolutionEntry, ReflectionRunResult};
     use crate::store::Store;
     use rig_core::tool::Tool;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::HashSet;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1561,6 +1614,8 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum MockMode {
+        ConnectionTool,
+        ConnectionText,
         Reflection,
         Verification,
         Status(u16),
@@ -1635,6 +1690,11 @@ mod tests {
 
     fn mock_response(mode: MockMode, call: usize, request: &str) -> (u16, String) {
         match mode {
+            MockMode::ConnectionTool => (
+                200,
+                tool_response(&[("recall_connection_check", r#"{"ok":true}"#)]).to_string(),
+            ),
+            MockMode::ConnectionText => (200, completion_response("OK")),
             MockMode::Status(status) => (status, "{\"error\":\"mock status\"}".into()),
             MockMode::InvalidJson => (200, "{not-json".into()),
             MockMode::MissingSteps => (200, completion_response("no tools")),
@@ -1729,6 +1789,26 @@ mod tests {
             silent_trace(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn connection_test_requires_openai_compatible_tool_calling() {
+        let (compatible_url, compatible_server) = spawn_mock_server(MockMode::ConnectionTool).await;
+        let result = test_connection(compatible_url, "mock-model".into(), String::new(), 10)
+            .await
+            .unwrap();
+        compatible_server.abort();
+        assert_eq!(
+            result.get("toolCalling").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let (text_url, text_server) = spawn_mock_server(MockMode::ConnectionText).await;
+        let error = test_connection(text_url, "mock-model".into(), String::new(), 10)
+            .await
+            .unwrap_err();
+        text_server.abort();
+        assert_eq!(error_code(&error), "invalid_response");
     }
 
     #[tokio::test]

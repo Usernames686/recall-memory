@@ -57,6 +57,7 @@ Tauri updater artifacts, generates `latest.json`, and publishes the signed
 the public key is embedded in `src-tauri/tauri.conf.json`.
 
 The default local model configuration is `http://127.0.0.1:11434/v1` with `qwen3:8b`. An OpenAI-compatible endpoint can be configured in the Settings page. API keys are stored in the macOS Keychain, not SQLite.
+The Settings connection check performs a harmless forced function call, so an endpoint that returns HTTP 200 but does not support OpenAI-compatible tools is reported as incompatible before an Evolution run starts.
 
 ## Verification
 

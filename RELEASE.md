@@ -10,8 +10,12 @@ with these GitHub Actions secrets configured:
 - `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` for notarization
 - `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for
   updater artifacts, once an updater public key is configured in the app
+- `RECALL_REAL_MODEL_BASE_URL`, `RECALL_REAL_MODEL_ID`, and
+  `RECALL_REAL_MODEL_API_KEY` for the release-gating tool-calling acceptance
+  test; optionally set `RECALL_REAL_MODEL_TIMEOUT_SECONDS` (default `300`)
 
-The workflow verifies both the main executable and MCP sidecar contain
+The workflow first runs the complete real remote model acceptance without
+fallback, then verifies both the main executable and MCP sidecar contain
 `arm64` and `x86_64`, notarizes the Universal DMG, staples the ticket, and
 uploads it to the tagged GitHub release. Tauri updater signing is intentionally
 separate and must not be enabled until a project-owned updater key is created

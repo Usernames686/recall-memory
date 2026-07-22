@@ -28,7 +28,11 @@ if (!signature) throw new Error(`Updater signature is empty for ${archive}`)
 
 const repository = process.env.GITHUB_REPOSITORY || "Usernames686/recall-memory"
 const server = process.env.GITHUB_SERVER_URL || "https://github.com"
-const tag = process.env.GITHUB_REF_NAME || `v${config.version}`
+const configuredTag = process.env.RECALL_RELEASE_TAG || process.env.GITHUB_REF_NAME || `v${config.version}`
+if (!/^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(configuredTag)) {
+  throw new Error(`Updater manifest requires a release tag such as v${config.version}; received ${configuredTag}`)
+}
+const tag = configuredTag
 const url = `${server}/${repository}/releases/download/${tag}/${encodeURIComponent(archive)}`
 const manifest = {
   version: config.version,

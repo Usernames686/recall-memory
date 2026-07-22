@@ -959,11 +959,16 @@ impl Store {
         {
             let (_, target, body) = revision_target.expect("checked above");
             let target = target.expect("checked above");
-            tx.execute(
+            let target_changed = tx.execute(
                 "UPDATE entries SET body=?1, summary=?2, updated_at=unixepoch(), version=version+1
                  WHERE id=?3 AND status='active'",
                 params![body, "由已批准 revision 更新", target],
             )?;
+            if target_changed == 0 {
+                return Err(StoreError::InvalidSetting(
+                    "revision target is no longer active; approval was not applied".into(),
+                ));
+            }
             snapshot_current_entry_with_context(
                 &tx,
                 &target,
@@ -1486,7 +1491,33 @@ impl Store {
     }
 
     pub fn rollback_entry(&self, entry_id: &str, version: i64) -> Result<(), StoreError> {
+        self.rollback_entry_checked(entry_id, version, None)
+    }
+
+    pub fn rollback_entry_checked(
+        &self,
+        entry_id: &str,
+        version: i64,
+        expected_current_version: Option<i64>,
+    ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        if let Some(expected) = expected_current_version {
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM entries WHERE id=?1",
+                    [entry_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Err(StoreError::InvalidSetting("entry not found".into()));
+            };
+            if current != expected {
+                return Err(StoreError::InvalidSetting(
+                    "entry changed after it was opened; refresh before rolling back".into(),
+                ));
+            }
+        }
         apply_entry_version(
             &tx,
             entry_id,
@@ -2898,7 +2929,7 @@ mod tests {
     };
     use crate::models::{
         Activity, CandidateVerification, EvolutionEntry, EvolutionSettingsInput,
-        ReflectionRunResult, RunnerConfigSnapshot, SchedulerState,
+        ReflectionRunResult, RunnerConfigSnapshot, SchedulerState, RISK_POLICY_VERSION,
     };
     use serde_json::json;
     use std::path::Path;
@@ -3325,6 +3356,85 @@ mod tests {
     }
 
     #[test]
+    fn revision_approval_fails_when_target_is_no_longer_active() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let entry =
+            |id: &str, kind: &str, body: &str, status: &str, target: Option<&str>| EvolutionEntry {
+                id: id.into(),
+                kind: kind.into(),
+                title: id.into(),
+                summary: "summary".into(),
+                body: body.into(),
+                status: status.into(),
+                risk: if kind == "revision" { "high" } else { "low" }.into(),
+                source_refs: vec!["activity-1".into()],
+                updated_at: 1,
+                origin_run_id: Some("run-1".into()),
+                target_entry_id: target.map(str::to_string),
+                version: 1,
+            };
+        store
+            .insert_entry(&entry("meta-target", "meta", "old", "active", None))
+            .unwrap();
+        store
+            .insert_entry(&entry(
+                "revision-1",
+                "revision",
+                "new",
+                "pending",
+                Some("meta-target"),
+            ))
+            .unwrap();
+        store.set_entry_status("meta-target", "disabled").unwrap();
+
+        assert!(store
+            .set_entry_status_with_reason("revision-1", "active", "approve")
+            .is_err());
+        let entries = store.list_entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "revision-1")
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "meta-target")
+                .unwrap()
+                .body,
+            "old"
+        );
+    }
+
+    #[test]
+    fn checked_entry_rollback_rejects_stale_ui_version() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let entry = EvolutionEntry {
+            id: "meta-1".into(),
+            kind: "meta".into(),
+            title: "Meta".into(),
+            summary: "v1".into(),
+            body: "body v1".into(),
+            status: "active".into(),
+            risk: "low".into(),
+            source_refs: vec![],
+            updated_at: 1,
+            origin_run_id: None,
+            target_entry_id: None,
+            version: 1,
+        };
+        store.insert_entry(&entry).unwrap();
+        store.set_entry_status("meta-1", "disabled").unwrap();
+        assert!(store.rollback_entry_checked("meta-1", 1, Some(1)).is_err());
+        assert_eq!(store.list_entries().unwrap()[0].status, "disabled");
+    }
+
+    #[test]
     fn evolution_run_state_is_persisted() {
         let dir = tempdir().unwrap();
         let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
@@ -3350,6 +3460,7 @@ mod tests {
             agent_mode: "verification".into(),
             auto_activate_low_risk: false,
             max_agent_steps: 7,
+            risk_policy_version: RISK_POLICY_VERSION.into(),
             fallback_enabled: true,
             fallback_base_url: "http://127.0.0.1:11435/v1".into(),
             fallback_model: "local-a".into(),
@@ -3391,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retry_snapshot_defaults_missing_pricing() {
+    fn legacy_retry_snapshot_defaults_missing_pricing_and_risk_policy() {
         let snapshot: RunnerConfigSnapshot = serde_json::from_value(json!({
             "provider": "remote",
             "baseUrl": "https://model.example/v1",
@@ -3408,6 +3519,7 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.input_price_per_million_usd, 0.0);
         assert_eq!(snapshot.output_price_per_million_usd, 0.0);
+        assert_eq!(snapshot.risk_policy_version, RISK_POLICY_VERSION);
     }
 
     #[test]

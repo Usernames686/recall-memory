@@ -219,6 +219,8 @@ pub struct RunnerConfigSnapshot {
     pub agent_mode: String,
     pub auto_activate_low_risk: bool,
     pub max_agent_steps: i64,
+    #[serde(default = "default_risk_policy_version")]
+    pub risk_policy_version: String,
     pub fallback_enabled: bool,
     pub fallback_base_url: String,
     pub fallback_model: String,
@@ -239,6 +241,7 @@ impl RunnerConfigSnapshot {
             agent_mode: settings.agent_mode.clone(),
             auto_activate_low_risk: settings.auto_activate_low_risk,
             max_agent_steps: settings.max_agent_steps,
+            risk_policy_version: default_risk_policy_version(),
             fallback_enabled: config.fallback_enabled,
             fallback_base_url: config.fallback_base_url.clone(),
             fallback_model: config.fallback_model.clone(),
@@ -247,6 +250,12 @@ impl RunnerConfigSnapshot {
             output_price_per_million_usd: config.output_price_per_million_usd,
         }
     }
+}
+
+pub const RISK_POLICY_VERSION: &str = "risk-v1";
+
+fn default_risk_policy_version() -> String {
+    RISK_POLICY_VERSION.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,6 +20,10 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      RECALL_REAL_MODEL_BASE_URL: ${{ secrets.RECALL_REAL_MODEL_BASE_URL }}
+      RECALL_REAL_MODEL_ID: ${{ secrets.RECALL_REAL_MODEL_ID }}
+      RECALL_REAL_MODEL_API_KEY: ${{ secrets.RECALL_REAL_MODEL_API_KEY }}
+      RECALL_REAL_MODEL_TIMEOUT_SECONDS: ${{ secrets.RECALL_REAL_MODEL_TIMEOUT_SECONDS || '300' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -41,16 +45,25 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RECALL_REAL_MODEL_BASE_URL: ${{ secrets.RECALL_REAL_MODEL_BASE_URL }}
+          RECALL_REAL_MODEL_ID: ${{ secrets.RECALL_REAL_MODEL_ID }}
+          RECALL_REAL_MODEL_API_KEY: ${{ secrets.RECALL_REAL_MODEL_API_KEY }}
         run: |
           set -euo pipefail
           missing=()
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD RECALL_REAL_MODEL_BASE_URL RECALL_REAL_MODEL_ID RECALL_REAL_MODEL_API_KEY; do
             if [[ -z "${!name}" ]]; then
               missing+=("$name")
             fi
           done
           if (( ${#missing[@]} > 0 )); then
             printf 'Missing required release secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          ref_name="${GITHUB_REF_NAME:-}"
+          if [[ -n "$ref_name" && ! "$ref_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'Release workflow must run from a semver tag, received: %s\n' "$ref_name" >&2
             exit 1
           fi
       - name: Import Developer ID certificate
@@ -62,6 +75,8 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+      - name: Verify the real remote Agent loop
+        run: pnpm test:real-model
       - run: pnpm test
       - run: pnpm test:e2e
       - run: pnpm tauri:build:universal
@@ -81,6 +96,8 @@ jobs:
           xcrun stapler validate "$DMG"
           hdiutil verify "$DMG"
       - name: Generate updater manifest
+        env:
+          RECALL_RELEASE_TAG: ${{ github.ref_name }}
         run: node scripts/create-updater-manifest.mjs
       - uses: softprops/action-gh-release@v2
         with:

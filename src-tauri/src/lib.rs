@@ -12,6 +12,7 @@ use models::{
     EvolutionRunDetail, EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult,
     McpInstallResult, ReflectionConfigInput, ReflectionConfigView, ReflectionRunResult,
     RunRollbackResult, RunnerConfigSnapshot, ScanSummary, SchedulerState, SourceSummary,
+    RISK_POLICY_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{
@@ -614,6 +615,7 @@ fn get_entry_version_diff(
 fn rollback_entry(
     entry_id: String,
     version: i64,
+    expected_version: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
     let store = state
@@ -621,7 +623,7 @@ fn rollback_entry(
         .lock()
         .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
     store
-        .rollback_entry(&entry_id, version)
+        .rollback_entry_checked(&entry_id, version, expected_version)
         .map_err(CommandError::store)
 }
 
@@ -745,6 +747,16 @@ async fn execute_evolution_refs(
     result
 }
 
+fn validate_retry_snapshot(snapshot: &RunnerConfigSnapshot) -> Result<(), String> {
+    if snapshot.risk_policy_version != RISK_POLICY_VERSION {
+        return Err(format!(
+            "原运行使用的风险规则版本 {} 已不受支持，请新建一次运行",
+            snapshot.risk_policy_version
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_evolution_inner(
     app: &AppHandle,
     store_ref: &Arc<Mutex<Store>>,
@@ -779,6 +791,7 @@ async fn execute_evolution_inner(
                     .evolution_run_config_snapshot(source_run_id)
                     .map_err(|err| err.to_string())?
                     .ok_or_else(|| "原运行没有不可变配置快照，请新建一次运行".to_string())?;
+                validate_retry_snapshot(&snapshot)?;
                 config.provider = snapshot.provider.clone();
                 config.base_url = snapshot.base_url.clone();
                 config.model = snapshot.model.clone();
@@ -1935,7 +1948,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{evolution_command_error, keyring_account, open_store_for_app};
+    use super::{
+        evolution_command_error, keyring_account, open_store_for_app, validate_retry_snapshot,
+    };
+    use crate::models::{RunnerConfigSnapshot, RISK_POLICY_VERSION};
 
     #[test]
     fn keyring_credentials_are_scoped_to_provider_and_endpoint() {
@@ -1963,6 +1979,29 @@ mod tests {
         assert!(!error.message.contains("secret-value"));
         assert!(!error.message.contains("/Users/alice"));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn retry_rejects_a_snapshot_from_an_unknown_risk_policy() {
+        let mut snapshot: RunnerConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "provider": "remote",
+            "baseUrl": "https://model.example/v1",
+            "model": "model-a",
+            "timeoutSeconds": 45,
+            "agentMode": "verification",
+            "autoActivateLowRisk": false,
+            "maxAgentSteps": 6,
+            "fallbackEnabled": false,
+            "fallbackBaseUrl": "http://127.0.0.1:11434/v1",
+            "fallbackModel": "qwen3:8b",
+            "fallbackTimeoutSeconds": 30
+        }))
+        .unwrap();
+        assert_eq!(snapshot.risk_policy_version, RISK_POLICY_VERSION);
+        validate_retry_snapshot(&snapshot).unwrap();
+
+        snapshot.risk_policy_version = "risk-v999".into();
+        assert!(validate_retry_snapshot(&snapshot).is_err());
     }
 
     #[test]

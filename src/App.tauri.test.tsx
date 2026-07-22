@@ -145,6 +145,18 @@ describe("Recall Memory Tauri workflows", () => {
     await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("cancel_evolution", undefined))
   })
 
+  it("persists Agent mode changes through the backend", async () => {
+    const current = snapshot()
+    mockBackend(current)
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Evolution Agent" }))
+    fireEvent.click(screen.getByRole("button", { name: "反思模式" }))
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("save_evolution_settings", {
+      input: expect.objectContaining({ agentMode: "reflection" }),
+    }))
+  })
+
   it("retries a failed immutable run snapshot", async () => {
     const current = snapshot("failed")
     mockBackend(current)
@@ -166,6 +178,20 @@ describe("Recall Memory Tauri workflows", () => {
     expect(screen.getByText(/证据不足.*检测到重复.*未发现冲突/)).toBeInTheDocument()
     expect(screen.getByText("反对证据：activity-2")).toBeInTheDocument()
     expect(screen.getByText("Always run focused tests before the full build.")).toBeInTheDocument()
+  })
+
+  it("submits an approval with an auditable reason", async () => {
+    const current = snapshot()
+    mockBackend(current)
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "审核中心" }))
+    fireEvent.click(screen.getByRole("button", { name: "批准" }))
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("review_entry", {
+      id: "entry-1",
+      status: "active",
+      reason: "人工审核批准",
+    }))
   })
 
   it("shows and dismisses a persisted Store recovery notice", async () => {

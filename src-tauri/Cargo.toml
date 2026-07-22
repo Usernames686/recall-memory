@@ -1,6 +1,6 @@
 [package]
 name = "recall-evolution"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local-first memory evolution for Codex and Claude Code"
 authors = ["Recall"]
 edition = "2021"
