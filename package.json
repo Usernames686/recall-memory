@@ -15,8 +15,8 @@
     "sidecar:release": "node scripts/prepare-sidecar.mjs --release",
     "sidecar:universal": "node scripts/prepare-sidecar.mjs --release --target universal-apple-darwin",
     "tauri:dev": "pnpm sidecar:dev && tauri dev",
-    "tauri:build": "pnpm sidecar:release && tauri build",
-    "tauri:build:universal": "pnpm sidecar:universal && tauri build --target universal-apple-darwin"
+    "tauri:build": "pnpm sidecar:release && node scripts/tauri-build.mjs",
+    "tauri:build:universal": "pnpm sidecar:universal && node scripts/tauri-build.mjs --target universal-apple-darwin"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

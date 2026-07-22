@@ -11,7 +11,7 @@ use models::{
     AgentTraceEvent, CacheCleanupPreview, DashboardSnapshot, EntryVersion, EntryVersionDiff,
     EvolutionRunDetail, EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult,
     McpInstallResult, ReflectionConfigInput, ReflectionConfigView, ReflectionRunResult,
-    RunRollbackResult, RunnerConfigSnapshot, ScanSummary, SourceSummary,
+    RunRollbackResult, RunnerConfigSnapshot, ScanSummary, SchedulerState, SourceSummary,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{
@@ -44,7 +44,7 @@ pub(crate) fn keyring_account(provider: &str, base_url: &str) -> String {
         .map(|url| url.to_string().trim_end_matches('/').to_string())
         .unwrap_or_else(|_| base_url.trim().trim_end_matches('/').to_string());
     let digest = Sha256::digest(format!("{provider}\n{normalized}").as_bytes());
-    format!("reflection-api-{}", hex::encode(digest)[..24].to_string())
+    format!("reflection-api-{}", &hex::encode(digest)[..24])
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -121,8 +121,19 @@ fn open_store_for_app(path: PathBuf) -> Store {
                 "Recall 数据库已隔离到 {}，正在创建新的 Store；原文件未删除",
                 quarantine.display()
             );
-            Store::open(path)
-                .unwrap_or_else(|new_error| panic!("Recall 无法创建恢复后的 Store：{new_error}"))
+            let recovered = Store::open(path)
+                .unwrap_or_else(|new_error| panic!("Recall 无法创建恢复后的 Store：{new_error}"));
+            let quarantined_name = quarantine
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("evolution.sqlite3.corrupt");
+            let _ = recovered.set_app_state(
+                "recovery_notice",
+                &format!(
+                    "检测到本地 Store 损坏，旧文件已隔离为 {quarantined_name}。Recall 已创建空 Store，请在数据管理中恢复最近备份。"
+                ),
+            );
+            recovered
         }
         Err(error) => panic!("Recall 无法打开本地 Store：{error}"),
     }
@@ -200,12 +211,14 @@ fn scan_sessions(days: i64, state: State<'_, AppState>) -> Result<ScanSummary, C
         ));
     }
     let settings = store.evolution_settings().map_err(CommandError::store)?;
-    let result = scanner::scan_sources_with_options(
+    let result = scanner::scan_sources_with_roots(
         &store,
         days,
         settings.codex_enabled,
         settings.claude_enabled,
         None,
+        std::path::Path::new(&settings.codex_source_path),
+        std::path::Path::new(&settings.claude_source_path),
     )
     .map_err(|err| CommandError::new("scan_failed", err.to_string(), true))?;
     store
@@ -345,13 +358,25 @@ fn save_evolution_settings(
             .disable()
             .map_err(|err| CommandError::new("autostart_error", err.to_string(), true))?;
     }
-    let store = state
+    let settings = state
         .store
         .lock()
-        .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
-    store
+        .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?
         .save_evolution_settings(&input)
-        .map_err(CommandError::store)
+        .map_err(CommandError::store)?;
+    let source_watcher = watcher::start(
+        app,
+        state.activity_signal.clone(),
+        PathBuf::from(&settings.codex_source_path),
+        PathBuf::from(&settings.claude_source_path),
+    )
+    .map_err(|err| CommandError::new("source_watch_error", err.to_string(), true))?;
+    *state
+        .watcher
+        .lock()
+        .map_err(|_| CommandError::new("watcher_locked", "来源监听器暂时不可用", true))? =
+        Some(source_watcher);
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -660,6 +685,24 @@ fn clear_reflected_activity_cache(
 }
 
 #[tauri::command]
+fn dismiss_recovery_notice(state: State<'_, AppState>) -> Result<(), CommandError> {
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
+    store
+        .set_app_state("recovery_notice", "")
+        .map_err(CommandError::store)?;
+    store
+        .append_audit(
+            "store_recovery_notice_dismissed",
+            None,
+            &serde_json::json!({"actor": "local-user"}),
+        )
+        .map_err(CommandError::store)
+}
+
+#[tauri::command]
 fn preview_reflected_activity_cache_cleanup(
     state: State<'_, AppState>,
 ) -> Result<CacheCleanupPreview, CommandError> {
@@ -848,12 +891,14 @@ async fn execute_evolution_inner(
         } else {
             Some(chrono::Utc::now().timestamp() - settings.lookback_days * 86_400)
         };
-        let scan = scanner::scan_sources_with_options(
+        let scan = scanner::scan_sources_with_roots(
             &store,
             settings.lookback_days,
             settings.codex_enabled,
             settings.claude_enabled,
             settings.listen_since,
+            std::path::Path::new(&settings.codex_source_path),
+            std::path::Path::new(&settings.claude_source_path),
         )
         .map_err(|err| err.to_string());
         let scan = match scan {
@@ -1402,10 +1447,11 @@ fn start_scheduler(
     activity_signal: Arc<tokio::sync::Notify>,
 ) {
     tauri::async_runtime::spawn(async move {
-        let mut listener_pending_count = 0i64;
-        let mut listener_last_change = 0i64;
-        let mut retry_after = 0i64;
-        let mut failure_count = 0u32;
+        let mut scheduler = store_ref
+            .lock()
+            .ok()
+            .and_then(|store| store.scheduler_state().ok())
+            .unwrap_or_default();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
@@ -1415,7 +1461,7 @@ fn start_scheduler(
                 continue;
             }
             let now = chrono::Utc::now().timestamp();
-            if now < retry_after {
+            if now < scheduler.retry_after {
                 continue;
             }
             let (due, listener_mode) = {
@@ -1429,9 +1475,18 @@ fn start_scheduler(
                     || !store.consent_granted().unwrap_or(false)
                     || settings.run_mode == "manual"
                 {
-                    listener_pending_count = 0;
+                    if scheduler != SchedulerState::default() {
+                        scheduler = SchedulerState::default();
+                        let _ = store.save_scheduler_state(&scheduler);
+                    }
                     (false, false)
                 } else if settings.run_mode == "scheduled" {
+                    if scheduler.listener_pending_count != 0 || scheduler.listener_last_change != 0
+                    {
+                        scheduler.listener_pending_count = 0;
+                        scheduler.listener_last_change = 0;
+                        let _ = store.save_scheduler_state(&scheduler);
+                    }
                     let due = store
                         .last_evolution_completed_at()
                         .ok()
@@ -1440,12 +1495,14 @@ fn start_scheduler(
                         .unwrap_or(true);
                     (due, false)
                 } else {
-                    let scanned = scanner::scan_sources_with_options(
+                    let scanned = scanner::scan_sources_with_roots(
                         &store,
                         settings.lookback_days,
                         settings.codex_enabled,
                         settings.claude_enabled,
                         settings.listen_since,
+                        std::path::Path::new(&settings.codex_source_path),
+                        std::path::Path::new(&settings.claude_source_path),
                     )
                     .is_ok();
                     let pending_count = if scanned {
@@ -1454,14 +1511,21 @@ fn start_scheduler(
                         0
                     };
                     let due = if pending_count == 0 {
-                        listener_pending_count = 0;
+                        if scheduler.listener_pending_count != 0
+                            || scheduler.listener_last_change != 0
+                        {
+                            scheduler.listener_pending_count = 0;
+                            scheduler.listener_last_change = 0;
+                            let _ = store.save_scheduler_state(&scheduler);
+                        }
                         false
-                    } else if pending_count != listener_pending_count {
-                        listener_pending_count = pending_count;
-                        listener_last_change = now;
+                    } else if pending_count != scheduler.listener_pending_count {
+                        scheduler.listener_pending_count = pending_count;
+                        scheduler.listener_last_change = now;
+                        let _ = store.save_scheduler_state(&scheduler);
                         false
                     } else {
-                        now - listener_last_change >= 120
+                        now - scheduler.listener_last_change >= 120
                     };
                     (due, true)
                 }
@@ -1471,19 +1535,24 @@ fn start_scheduler(
                     execute_evolution_refs(&app, &store_ref, &running, &cancel_requested, None)
                         .await;
                 if result.is_ok() {
-                    failure_count = 0;
-                    retry_after = 0;
+                    scheduler.failure_count = 0;
+                    scheduler.retry_after = 0;
                 } else {
-                    failure_count = failure_count.saturating_add(1);
-                    let delay = (60i64 * 2i64.pow(failure_count.min(6))).min(3_600);
-                    retry_after = now + delay;
+                    scheduler.failure_count = scheduler.failure_count.saturating_add(1);
+                    let delay =
+                        (60i64 * 2i64.pow(scheduler.failure_count.clamp(0, 6) as u32)).min(3_600);
+                    scheduler.retry_after = now + delay;
                 }
                 if listener_mode {
                     if result.is_ok() {
-                        listener_pending_count = 0;
+                        scheduler.listener_pending_count = 0;
+                        scheduler.listener_last_change = 0;
                     } else {
-                        listener_last_change = now;
+                        scheduler.listener_last_change = now;
                     }
+                }
+                if let Ok(store) = store_ref.lock() {
+                    let _ = store.save_scheduler_state(&scheduler);
                 }
             }
         }
@@ -1561,6 +1630,21 @@ fn install_mcp(state: State<'_, AppState>) -> Result<McpInstallResult, CommandEr
     Ok(result)
 }
 
+fn record_mcp_health(store: &Store, status: &str, error: Option<&str>) {
+    let _ = store.set_app_state(
+        "mcp_last_checked",
+        &chrono::Utc::now().timestamp().to_string(),
+    );
+    let _ = store.set_app_state("mcp_health_status", status);
+    let safe_error = error
+        .map(scanner::redact)
+        .unwrap_or_default()
+        .chars()
+        .take(240)
+        .collect::<String>();
+    let _ = store.set_app_state("mcp_health_error", &safe_error);
+}
+
 #[tauri::command]
 fn test_mcp(state: State<'_, AppState>) -> Result<serde_json::Value, CommandError> {
     let store = state
@@ -1569,8 +1653,20 @@ fn test_mcp(state: State<'_, AppState>) -> Result<serde_json::Value, CommandErro
         .map_err(|_| CommandError::new("store_locked", "Store 暂时不可用", true))?;
     let sidecar = mcp::sidecar_path()
         .map_err(|err| CommandError::new("mcp_sidecar_missing", err.to_string(), false))?;
-    mcp::smoke_test(&sidecar, store.path())
-        .map_err(|err| CommandError::new("mcp_test_failed", err.to_string(), true))
+    match mcp::smoke_test(&sidecar, store.path()) {
+        Ok(result) => {
+            record_mcp_health(&store, "ok", None);
+            Ok(result)
+        }
+        Err(error) => {
+            record_mcp_health(&store, "error", Some(&error.to_string()));
+            Err(CommandError::new(
+                "mcp_test_failed",
+                error.to_string(),
+                true,
+            ))
+        }
+    }
 }
 
 #[tauri::command]
@@ -1596,6 +1692,11 @@ fn test_mcp_target(
         status.claude
     };
     if !configured {
+        record_mcp_health(
+            &store,
+            "error",
+            Some(&format!("{target} 尚未安装 Recall MCP")),
+        );
         return Err(CommandError::new(
             "mcp_not_installed",
             format!("{target} 尚未安装 Recall MCP"),
@@ -1604,9 +1705,20 @@ fn test_mcp_target(
     }
     let sidecar = mcp::sidecar_path()
         .map_err(|err| CommandError::new("mcp_sidecar_missing", err.to_string(), false))?;
-    let smoke = mcp::smoke_test(&sidecar, store.path())
-        .map_err(|err| CommandError::new("mcp_test_failed", err.to_string(), true))?;
-    Ok(serde_json::json!({"target": target, "configured": true, "smoke": smoke}))
+    match mcp::smoke_test(&sidecar, store.path()) {
+        Ok(smoke) => {
+            record_mcp_health(&store, "ok", None);
+            Ok(serde_json::json!({"target": target, "configured": true, "smoke": smoke}))
+        }
+        Err(error) => {
+            record_mcp_health(&store, "error", Some(&error.to_string()));
+            Err(CommandError::new(
+                "mcp_test_failed",
+                error.to_string(),
+                true,
+            ))
+        }
+    }
 }
 
 #[tauri::command]
@@ -1625,12 +1737,15 @@ fn uninstall_mcp(state: State<'_, AppState>) -> Result<serde_json::Value, Comman
 
 fn snapshot(store: &Store) -> Result<DashboardSnapshot, store::StoreError> {
     let sessions = store.list_sessions(200)?;
+    let evolution = store.evolution_settings()?;
+    let codex_root = PathBuf::from(&evolution.codex_source_path);
+    let claude_root = PathBuf::from(&evolution.claude_source_path);
     let mut sources = vec![
         SourceSummary {
             provider: "codex".to_string(),
-            root: paths::codex_home().display().to_string(),
-            available: paths::codex_home().join("sessions").is_dir()
-                || paths::codex_home().join("archived_sessions").is_dir(),
+            root: scanner::display_source_root(&codex_root),
+            available: codex_root.join("sessions").is_dir()
+                || codex_root.join("archived_sessions").is_dir(),
             session_count: 0,
             activity_count: 0,
             error: None,
@@ -1640,8 +1755,8 @@ fn snapshot(store: &Store) -> Result<DashboardSnapshot, store::StoreError> {
         },
         SourceSummary {
             provider: "claude-code".to_string(),
-            root: paths::claude_home().display().to_string(),
-            available: paths::claude_home().join("projects").is_dir(),
+            root: scanner::display_source_root(&claude_root),
+            available: claude_root.join("projects").is_dir(),
             session_count: 0,
             activity_count: 0,
             error: None,
@@ -1677,7 +1792,7 @@ fn snapshot(store: &Store) -> Result<DashboardSnapshot, store::StoreError> {
         dirty_count: store.dirty_count()?,
         last_reflection_at: store.last_reflection_at()?,
         config: store.config()?,
-        evolution: store.evolution_settings()?,
+        evolution,
         run,
         run_history: store.list_evolution_runs(100)?,
         store_stats: store.store_stats()?,
@@ -1686,6 +1801,7 @@ fn snapshot(store: &Store) -> Result<DashboardSnapshot, store::StoreError> {
         backups: store.list_backups()?,
         audit_events: store.list_audit_events(100)?,
         mcp: mcp::status(store),
+        recovery_notice: store.recovery_notice()?,
     })
 }
 
@@ -1744,8 +1860,18 @@ pub fn run() {
         })
         .setup(|app| {
             let state = app.state::<AppState>();
-            let source_watcher =
-                watcher::start(app.handle().clone(), state.activity_signal.clone())?;
+            let settings = state
+                .store
+                .lock()
+                .map_err(|_| std::io::Error::other("store lock poisoned"))?
+                .evolution_settings()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let source_watcher = watcher::start(
+                app.handle().clone(),
+                state.activity_signal.clone(),
+                PathBuf::from(settings.codex_source_path),
+                PathBuf::from(settings.claude_source_path),
+            )?;
             *state
                 .watcher
                 .lock()
@@ -1795,6 +1921,7 @@ pub fn run() {
             export_redacted_store,
             preview_reflected_activity_cache_cleanup,
             clear_reflected_activity_cache,
+            dismiss_recovery_notice,
             install_mcp,
             test_mcp,
             test_mcp_target,
@@ -1806,7 +1933,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{evolution_command_error, keyring_account};
+    use super::{evolution_command_error, keyring_account, open_store_for_app};
 
     #[test]
     fn keyring_credentials_are_scoped_to_provider_and_endpoint() {
@@ -1834,5 +1961,21 @@ mod tests {
         assert!(!error.message.contains("secret-value"));
         assert!(!error.message.contains("/Users/alice"));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn corrupted_store_is_quarantined_and_reported_to_the_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evolution.sqlite3");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        let store = open_store_for_app(path.clone());
+        assert!(store.recovery_notice().unwrap().unwrap().contains("已隔离"));
+        assert!(dir
+            .path()
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")));
+        assert!(path.exists());
     }
 }

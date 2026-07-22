@@ -10,8 +10,15 @@ Recall Memory is a local-first macOS app that turns redacted Codex and Claude Co
 - Review queue, immutable revisions, diffs, per-run rollback, audit history.
 - Two read-only MCP tools that expose only Active Meta and Skill entries.
 - Local SQLite backup, restore, redacted export, and cache maintenance.
+- Configurable Codex and Claude Code source roots with persisted scheduler
+  backoff/debounce state.
 
 Original session files are never modified. The app only supports Codex and Claude Code in this MVP.
+
+MCP call summaries are kept outside the Active Store in a permission-restricted
+JSONL file. They contain only tool/action/status metadata and are compacted to a
+30-day, 10,000-record, 2 MiB bound. They are intentionally excluded from Active
+Store backup and restore.
 
 ## Development
 
@@ -38,7 +45,10 @@ pnpm tauri:build:universal
 
 Developer ID signing, notarization, and updater signatures require the release
 owner's Apple certificate and Tauri signing secrets; unsigned local builds are
-for development and MVP demonstrations only.
+for development and MVP demonstrations only. On macOS, the local build script
+uses an ad-hoc identity when `APPLE_SIGNING_IDENTITY` is absent so the complete
+app bundle, including its MCP sidecar and resources, still passes strict
+`codesign` verification. Release CI keeps using its configured Developer ID.
 
 The default local model configuration is `http://127.0.0.1:11434/v1` with `qwen3:8b`. An OpenAI-compatible endpoint can be configured in the Settings page. API keys are stored in the macOS Keychain, not SQLite.
 

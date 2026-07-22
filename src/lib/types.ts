@@ -70,6 +70,8 @@ export interface EvolutionSettings {
   launchAtLogin: boolean
   notificationsEnabled: boolean
   agentMode: AgentMode
+  codexSourcePath: string
+  claudeSourcePath: string
 }
 
 export interface EvolutionRunState {
@@ -193,8 +195,11 @@ export interface Snapshot {
     codex: boolean
     claude: boolean
     lastChecked?: number
+    healthStatus?: "unknown" | "ok" | "error"
+    healthError?: string
     recentCalls: McpCallSummary[]
   }
+  recoveryNotice?: string
 }
 
 export interface McpCallSummary {

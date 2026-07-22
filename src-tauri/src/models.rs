@@ -112,6 +112,8 @@ pub struct DashboardSnapshot {
     pub backups: Vec<StoreBackup>,
     pub audit_events: Vec<AuditEvent>,
     pub mcp: McpStatus,
+    #[serde(default)]
+    pub recovery_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,6 +122,8 @@ pub struct McpStatus {
     pub codex: bool,
     pub claude: bool,
     pub last_checked: Option<i64>,
+    pub health_status: String,
+    pub health_error: Option<String>,
     pub recent_calls: Vec<McpCallSummary>,
 }
 
@@ -306,6 +310,8 @@ pub struct EvolutionSettingsView {
     pub launch_at_login: bool,
     pub notifications_enabled: bool,
     pub agent_mode: String,
+    pub codex_source_path: String,
+    pub claude_source_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +332,19 @@ pub struct EvolutionSettingsInput {
     pub notifications_enabled: bool,
     #[serde(default = "default_agent_mode")]
     pub agent_mode: String,
+    #[serde(default)]
+    pub codex_source_path: String,
+    #[serde(default)]
+    pub claude_source_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerState {
+    pub retry_after: i64,
+    pub failure_count: i64,
+    pub listener_pending_count: i64,
+    pub listener_last_change: i64,
 }
 
 fn default_true() -> bool {

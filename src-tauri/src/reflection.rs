@@ -806,6 +806,7 @@ pub async fn test_connection(
     Ok(serde_json::json!({"ok":true,"model":model,"status":status.as_u16()}))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_agent(
     provider: &str,
     base_url: String,
@@ -892,6 +893,7 @@ pub async fn generate_agent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_agent_once(
     base_url: String,
     model: String,
@@ -1773,7 +1775,7 @@ mod tests {
             )
             .unwrap();
         store
-            .persist_evolution_result(run_id, &result, &[activity.id.clone()], 1)
+            .persist_evolution_result(run_id, &result, std::slice::from_ref(&activity.id), 1)
             .unwrap();
         let candidate_id = result.generated[0].id.clone();
         store

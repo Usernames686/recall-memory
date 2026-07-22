@@ -3,10 +3,10 @@ use crate::models::{
     EntryVersion, EntryVersionDiff, EvolutionEntry, EvolutionRunDetail, EvolutionRunState,
     EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult, McpCallSummary,
     RedactionCategoryCount, RedactionReport, ReflectionConfigView, ReflectionRunResult,
-    RunRollbackResult, RunnerConfigSnapshot, SessionSummary, StoreBackup, StoreStats,
-    DEFAULT_AGENT_MODE, DEFAULT_CONTEXT_MODE, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL,
-    DEFAULT_INPUT_PRICE_PER_MILLION_USD, DEFAULT_MODEL_PROVIDER, DEFAULT_MODEL_TIMEOUT_SECONDS,
-    DEFAULT_OUTPUT_PRICE_PER_MILLION_USD,
+    RunRollbackResult, RunnerConfigSnapshot, SchedulerState, SessionSummary, StoreBackup,
+    StoreStats, DEFAULT_AGENT_MODE, DEFAULT_CONTEXT_MODE, DEFAULT_FALLBACK_BASE_URL,
+    DEFAULT_FALLBACK_MODEL, DEFAULT_INPUT_PRICE_PER_MILLION_USD, DEFAULT_MODEL_PROVIDER,
+    DEFAULT_MODEL_TIMEOUT_SECONDS, DEFAULT_OUTPUT_PRICE_PER_MILLION_USD,
 };
 use crate::paths;
 use regex::Regex;
@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transactio
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +35,10 @@ pub struct Store {
     read_only: bool,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
+const MCP_TELEMETRY_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MCP_TELEMETRY_MAX_RECORDS: usize = 10_000;
+const MCP_TELEMETRY_RETENTION_SECONDS: i64 = 30 * 86_400;
 
 #[derive(Debug, Clone)]
 pub struct ScanCursor {
@@ -56,6 +59,15 @@ impl Store {
             "
             CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS scheduler_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                retry_after INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                listener_pending_count INTEGER NOT NULL DEFAULT 0,
+                listener_last_change INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT OR IGNORE INTO scheduler_state(id) VALUES (1);
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 applied_at INTEGER NOT NULL
@@ -253,6 +265,79 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn set_app_state(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        if self.read_only {
+            return Err(StoreError::InvalidSetting(
+                "read-only store cannot update app state".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO app_state(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn app_state(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM app_state WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn recovery_notice(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .app_state("recovery_notice")?
+            .filter(|value| !value.trim().is_empty()))
+    }
+
+    pub fn scheduler_state(&self) -> Result<SchedulerState, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT retry_after, failure_count, listener_pending_count,
+                    listener_last_change
+             FROM scheduler_state WHERE id=1",
+            [],
+            |row| {
+                Ok(SchedulerState {
+                    retry_after: row.get(0)?,
+                    failure_count: row.get(1)?,
+                    listener_pending_count: row.get(2)?,
+                    listener_last_change: row.get(3)?,
+                })
+            },
+        )?)
+    }
+
+    pub fn save_scheduler_state(&self, state: &SchedulerState) -> Result<(), StoreError> {
+        if self.read_only {
+            return Err(StoreError::InvalidSetting(
+                "read-only store cannot update scheduler state".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO scheduler_state
+                (id, retry_after, failure_count, listener_pending_count,
+                 listener_last_change, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, unixepoch())
+             ON CONFLICT(id) DO UPDATE SET
+                retry_after=excluded.retry_after,
+                failure_count=excluded.failure_count,
+                listener_pending_count=excluded.listener_pending_count,
+                listener_last_change=excluded.listener_last_change,
+                updated_at=excluded.updated_at",
+            params![
+                state.retry_after.max(0),
+                state.failure_count.max(0),
+                state.listener_pending_count.max(0),
+                state.listener_last_change.max(0)
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_consent(&self, granted: bool) -> Result<(), StoreError> {
@@ -589,6 +674,18 @@ impl Store {
              VALUES (unixepoch(), ?1, ?2, ?3)",
             params![tool_name, action, result_status],
         )?;
+        self.conn.execute(
+            "DELETE FROM mcp_call_log
+             WHERE occurred_at < unixepoch() - ?1
+                OR id NOT IN (
+                    SELECT id FROM mcp_call_log
+                    ORDER BY occurred_at DESC, id DESC LIMIT ?2
+                )",
+            params![
+                MCP_TELEMETRY_RETENTION_SECONDS,
+                MCP_TELEMETRY_MAX_RECORDS as i64
+            ],
+        )?;
         Ok(())
     }
 
@@ -612,6 +709,63 @@ impl Store {
             "result_status": crate::scanner::redact(result_status)
         });
         writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        file.flush()?;
+        drop(file);
+        restrict_file_permissions(&path)?;
+        self.compact_mcp_telemetry()?;
+        Ok(())
+    }
+
+    fn compact_mcp_telemetry(&self) -> Result<(), StoreError> {
+        let path = self.mcp_telemetry_path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let file = fs::File::open(&path)?;
+        let lines = BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<_>>();
+        let original_count = lines.len();
+        let mut records = lines
+            .into_iter()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| value.get("occurred_at").and_then(|item| item.as_i64()))
+                    .map(|occurred_at| {
+                        occurred_at >= now.saturating_sub(MCP_TELEMETRY_RETENTION_SECONDS)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let mut compacted = records.len() != original_count;
+        if records.len() > MCP_TELEMETRY_MAX_RECORDS {
+            records.drain(..records.len() - MCP_TELEMETRY_MAX_RECORDS);
+            compacted = true;
+        }
+        let mut total_bytes = records.iter().map(|line| line.len() + 1).sum::<usize>();
+        while total_bytes > MCP_TELEMETRY_MAX_BYTES && !records.is_empty() {
+            total_bytes = total_bytes.saturating_sub(records[0].len() + 1);
+            records.remove(0);
+            compacted = true;
+        }
+        if !compacted && metadata.len() as usize <= MCP_TELEMETRY_MAX_BYTES {
+            return Ok(());
+        }
+        let temporary = path.with_extension(format!("mcp-calls.tmp-{}", std::process::id()));
+        {
+            let mut output = fs::File::create(&temporary)?;
+            for line in records {
+                writeln!(output, "{line}")?;
+            }
+            output.flush()?;
+        }
+        restrict_file_permissions(&temporary)?;
+        fs::rename(&temporary, &path)?;
         restrict_file_permissions(&path)?;
         Ok(())
     }
@@ -621,6 +775,9 @@ impl Store {
     }
 
     pub fn recent_mcp_calls(&self, limit: i64) -> Result<Vec<McpCallSummary>, StoreError> {
+        if !self.read_only {
+            let _ = self.compact_mcp_telemetry();
+        }
         let limit = limit.clamp(1, 1000) as usize;
         let mut stmt = self.conn.prepare(
             "SELECT id, occurred_at, tool_name, action, result_status
@@ -646,6 +803,13 @@ impl Store {
                 else {
                     continue;
                 };
+                if occurred_at
+                    < chrono::Utc::now()
+                        .timestamp()
+                        .saturating_sub(MCP_TELEMETRY_RETENTION_SECONDS)
+                {
+                    continue;
+                }
                 calls.push(McpCallSummary {
                     id: -((index as i64) + 1),
                     occurred_at,
@@ -958,6 +1122,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_evolution_run_with_snapshot(
         &self,
         run_id: &str,
@@ -1044,6 +1209,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_evolution_run(
         &self,
         run_id: &str,
@@ -1169,6 +1335,7 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_trace_event(
         &self,
         run_id: &str,
@@ -1650,7 +1817,7 @@ impl Store {
                 created_at,
             });
         }
-        backups.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at));
         Ok(backups)
     }
 
@@ -1761,6 +1928,7 @@ impl Store {
                 return Err(error);
             }
         };
+        self.set_app_state("recovery_notice", "")?;
         Ok(MaintenanceResult {
             path: Some(path.display().to_string()),
             affected,
@@ -1869,7 +2037,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT completed_at FROM evolution_runs
-                 WHERE completed_at IS NOT NULL
+                 WHERE phase='completed' AND completed_at IS NOT NULL
                  ORDER BY completed_at DESC LIMIT 1",
                 [],
                 |row| row.get(0),
@@ -1920,10 +2088,7 @@ impl Store {
         };
         let base_url = get("base_url")?;
         let model = get("model")?;
-        let fallback_enabled = match get("fallback_enabled")?.as_str() {
-            "false" | "0" => false,
-            _ => true,
-        };
+        let fallback_enabled = !matches!(get("fallback_enabled")?.as_str(), "false" | "0");
         let fallback_base_url = match get("fallback_base_url")? {
             value if value.trim().is_empty() => DEFAULT_FALLBACK_BASE_URL.to_string(),
             value => value,
@@ -2023,6 +2188,14 @@ impl Store {
         let schedule = parse_i64("schedule_hours", 12)?.clamp(1, 24);
         let max_steps = parse_i64("max_agent_steps", 6)?.clamp(2, 8);
         let since = get("listen_since")?.parse::<i64>().ok();
+        let codex_source_path = normalize_source_path(
+            &get("codex_source_path")?,
+            &paths::codex_home().to_string_lossy(),
+        )?;
+        let claude_source_path = normalize_source_path(
+            &get("claude_source_path")?,
+            &paths::claude_home().to_string_lossy(),
+        )?;
         Ok(EvolutionSettingsView {
             enabled: parse_bool("agent_enabled", true)?,
             codex_enabled: parse_bool("codex_enabled", true)?,
@@ -2039,6 +2212,8 @@ impl Store {
                 "verification" => "verification".to_string(),
                 _ => DEFAULT_AGENT_MODE.to_string(),
             },
+            codex_source_path,
+            claude_source_path,
         })
     }
 
@@ -2067,6 +2242,11 @@ impl Store {
         if !matches!(input.agent_mode.as_str(), "reflection" | "verification") {
             return Err(StoreError::InvalidSetting("invalid agent mode".into()));
         }
+        let current = self.evolution_settings()?;
+        let codex_source_path =
+            normalize_source_path(&input.codex_source_path, &current.codex_source_path)?;
+        let claude_source_path =
+            normalize_source_path(&input.claude_source_path, &current.claude_source_path)?;
         for (key, value) in [
             ("agent_enabled", input.enabled.to_string()),
             ("codex_enabled", input.codex_enabled.to_string()),
@@ -2085,6 +2265,8 @@ impl Store {
                 input.notifications_enabled.to_string(),
             ),
             ("agent_mode", input.agent_mode.clone()),
+            ("codex_source_path", codex_source_path),
+            ("claude_source_path", claude_source_path),
         ] {
             self.conn.execute(
                 "INSERT INTO config(key,value) VALUES (?1,?2)
@@ -2581,6 +2763,19 @@ fn run_migrations(conn: &mut Connection) -> Result<(), StoreError> {
                     [],
                 )?;
             }
+            5 => {
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS scheduler_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        retry_after INTEGER NOT NULL DEFAULT 0,
+                        failure_count INTEGER NOT NULL DEFAULT 0,
+                        listener_pending_count INTEGER NOT NULL DEFAULT 0,
+                        listener_last_change INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                     );
+                     INSERT OR IGNORE INTO scheduler_state(id) VALUES (1);",
+                )?;
+            }
             _ => unreachable!(),
         }
         tx.execute(
@@ -2623,6 +2818,33 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusq
         }
     }
     Ok(false)
+}
+
+fn normalize_source_path(value: &str, fallback: &str) -> Result<String, StoreError> {
+    let raw = if value.trim().is_empty() {
+        fallback.trim()
+    } else {
+        value.trim()
+    };
+    let path = if raw == "~" {
+        dirs::home_dir().ok_or_else(|| {
+            StoreError::InvalidSetting("cannot resolve the user home directory".into())
+        })?
+    } else if let Some(relative) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| {
+                StoreError::InvalidSetting("cannot resolve the user home directory".into())
+            })?
+            .join(relative)
+    } else {
+        PathBuf::from(raw)
+    };
+    if !path.is_absolute() {
+        return Err(StoreError::InvalidSetting(
+            "source paths must be absolute or begin with ~/".into(),
+        ));
+    }
+    Ok(path.to_string_lossy().to_string())
 }
 
 fn sanitize_export_paths(value: &mut serde_json::Value) {
@@ -2670,10 +2892,13 @@ fn sanitize_stored_error(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_export_paths, Store, CURRENT_SCHEMA_VERSION};
+    use super::{
+        sanitize_export_paths, Store, CURRENT_SCHEMA_VERSION, MCP_TELEMETRY_MAX_BYTES,
+        MCP_TELEMETRY_MAX_RECORDS,
+    };
     use crate::models::{
         Activity, CandidateVerification, EvolutionEntry, EvolutionSettingsInput,
-        ReflectionRunResult, RunnerConfigSnapshot,
+        ReflectionRunResult, RunnerConfigSnapshot, SchedulerState,
     };
     use serde_json::json;
     use std::path::Path;
@@ -2728,6 +2953,112 @@ mod tests {
             })
             .unwrap();
         assert_eq!(applied, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn scheduler_backoff_and_listener_state_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        {
+            let store = Store::open(path.clone()).unwrap();
+            store
+                .save_scheduler_state(&SchedulerState {
+                    retry_after: 2_000_000_000,
+                    failure_count: 4,
+                    listener_pending_count: 12,
+                    listener_last_change: 1_999_999_900,
+                })
+                .unwrap();
+        }
+        let reopened = Store::open(path).unwrap();
+        assert_eq!(
+            reopened.scheduler_state().unwrap(),
+            SchedulerState {
+                retry_after: 2_000_000_000,
+                failure_count: 4,
+                listener_pending_count: 12,
+                listener_last_change: 1_999_999_900,
+            }
+        );
+    }
+
+    #[test]
+    fn version_four_store_upgrades_to_scheduler_schema_without_losing_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE entries (
+                        id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        risk TEXT NOT NULL,
+                        source_refs_json TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        origin_run_id TEXT,
+                        target_entry_id TEXT,
+                        version INTEGER NOT NULL DEFAULT 1
+                     );
+                     INSERT INTO entries VALUES
+                        ('legacy-meta','meta','Legacy','Keep me','Preserved','active','low','[]',1,NULL,NULL,1);
+                     PRAGMA user_version=4;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(path).unwrap();
+        assert!(store
+            .list_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == "legacy-meta"));
+        assert_eq!(store.scheduler_state().unwrap(), SchedulerState::default());
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn mcp_telemetry_is_redacted_permission_scoped_and_bounded() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let path = store.mcp_telemetry_path();
+        let now = chrono::Utc::now().timestamp();
+        let mut lines = String::new();
+        lines.push_str(
+            &serde_json::json!({
+                "occurred_at": now - 31 * 86_400,
+                "tool_name": "expired",
+                "action": "meta",
+                "result_status": "ok"
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        for index in 0..(MCP_TELEMETRY_MAX_RECORDS + 25) {
+            lines.push_str(
+                &serde_json::json!({
+                    "occurred_at": now,
+                    "tool_name": "evolution_context",
+                    "action": format!("meta-{index}"),
+                    "result_status": "ok"
+                })
+                .to_string(),
+            );
+            lines.push('\n');
+        }
+        std::fs::write(&path, lines).unwrap();
+        store.compact_mcp_telemetry().unwrap();
+        let compacted = std::fs::read_to_string(&path).unwrap();
+        assert!(!compacted.contains("expired"));
+        assert!(compacted.lines().count() <= MCP_TELEMETRY_MAX_RECORDS);
+        assert!(std::fs::metadata(&path).unwrap().len() as usize <= MCP_TELEMETRY_MAX_BYTES);
     }
 
     #[test]
@@ -2925,11 +3256,14 @@ mod tests {
             launch_at_login: true,
             notifications_enabled: false,
             agent_mode: "verification".into(),
+            codex_source_path: dir.path().join("codex").display().to_string(),
+            claude_source_path: dir.path().join("claude").display().to_string(),
         };
         let saved = store.save_evolution_settings(&input).unwrap();
         assert_eq!(saved.lookback_days, 7);
         assert_eq!(saved.schedule_hours, 6);
         assert!(!saved.claude_enabled);
+        assert!(saved.codex_source_path.ends_with("/codex"));
         drop(store);
         let reopened = Store::open(path).unwrap();
         assert_eq!(reopened.evolution_settings().unwrap().run_mode, "scheduled");
@@ -3225,6 +3559,12 @@ mod tests {
         let run = store.current_evolution_run().unwrap().unwrap();
         assert_eq!(run.phase, "interrupted");
         assert_eq!(store.dirty_count().unwrap(), 1);
+        assert_eq!(store.last_evolution_completed_at().unwrap(), None);
+        store.start_evolution_run("run-2", "scheduled").unwrap();
+        store
+            .update_evolution_run("run-2", "completed", 1, 0, 0, 0, 0, None)
+            .unwrap();
+        assert!(store.last_evolution_completed_at().unwrap().is_some());
     }
 
     #[test]

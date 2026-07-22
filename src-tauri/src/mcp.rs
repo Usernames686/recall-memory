@@ -1,7 +1,6 @@
 use crate::models::{EvolutionEntry, McpInstallResult, McpStatus};
 use crate::paths;
 use crate::store::Store;
-use chrono::Utc;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, Write};
@@ -555,7 +554,22 @@ pub fn status(store: &Store) -> McpStatus {
     McpStatus {
         codex,
         claude,
-        last_checked: Some(Utc::now().timestamp()),
+        last_checked: store
+            .app_state("mcp_last_checked")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok()),
+        health_status: store
+            .app_state("mcp_health_status")
+            .ok()
+            .flatten()
+            .filter(|value| matches!(value.as_str(), "ok" | "error"))
+            .unwrap_or_else(|| "unknown".into()),
+        health_error: store
+            .app_state("mcp_health_error")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty()),
         recent_calls: store.recent_mcp_calls(20).unwrap_or_default(),
     }
 }
@@ -564,7 +578,7 @@ pub fn status(store: &Store) -> McpStatus {
 mod tests {
     use super::{
         handle_request, install_claude, install_codex, restore_or_remove_claude,
-        restore_or_remove_codex,
+        restore_or_remove_codex, status,
     };
     use crate::models::EvolutionEntry;
     use crate::store::Store;
@@ -746,6 +760,20 @@ mod tests {
         let calls = store.recent_mcp_calls(20).unwrap();
         assert_eq!(calls.len(), before_calls + 1);
         assert_eq!(calls[0].tool_name, "evolution_context");
+    }
+
+    #[test]
+    fn mcp_status_reports_only_persisted_real_health_checks() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("db.sqlite")).unwrap();
+        let initial = status(&store);
+        assert_eq!(initial.health_status, "unknown");
+        assert_eq!(initial.last_checked, None);
+        store.set_app_state("mcp_health_status", "ok").unwrap();
+        store.set_app_state("mcp_last_checked", "1234").unwrap();
+        let checked = status(&store);
+        assert_eq!(checked.health_status, "ok");
+        assert_eq!(checked.last_checked, Some(1234));
     }
 
     #[test]

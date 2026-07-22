@@ -21,8 +21,9 @@ read context explicitly when their workflow requires it.
 
 - Only `active` entries are returned. Pending and rejected candidates remain local to
   the review queue.
-- The existing two MCP tools remain unchanged: `evolution_context` and
-  `evolution_submit_candidate`.
+- The MCP bridge exposes exactly two read-only tools: `evolution_context` and
+  `evolution_run_status`. Candidate creation stays inside the restricted desktop
+  Agent and review workflow.
 - Context mode is stored in the existing SQLite key/value configuration. Existing
   installations without a mode default to `guided`.
 - Host-level automatic injection is intentionally out of scope. It requires a

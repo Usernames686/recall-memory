@@ -9,4 +9,6 @@ test("first-use flow and agent settings remain usable", async ({ page }) => {
   await page.getByLabel("设置分类").getByRole("button", { name: "数据源" }).click()
   await expect(page.getByText("历史回看范围")).toBeVisible()
   await expect(page.getByRole("button", { name: "30 天" })).toBeVisible()
+  await expect(page.getByLabel("Codex 根目录")).toHaveValue("~/.codex")
+  await expect(page.getByLabel("Claude Code 根目录")).toHaveValue("~/.claude")
 })

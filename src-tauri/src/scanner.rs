@@ -1,4 +1,5 @@
 use crate::models::{Activity, ScanSummary, SessionSummary, SourceSummary};
+#[cfg(test)]
 use crate::paths;
 use crate::store::{Store, StoreError};
 use chrono::{DateTime, Utc};
@@ -36,12 +37,33 @@ pub fn scan_sources(store: &Store, days: i64) -> Result<ScanSummary, ScanError> 
     scan_sources_with_options(store, days, true, true, None)
 }
 
+#[cfg(test)]
 pub fn scan_sources_with_options(
     store: &Store,
     days: i64,
     codex_enabled: bool,
     claude_enabled: bool,
     since: Option<i64>,
+) -> Result<ScanSummary, ScanError> {
+    scan_sources_with_roots(
+        store,
+        days,
+        codex_enabled,
+        claude_enabled,
+        since,
+        &paths::codex_home(),
+        &paths::claude_home(),
+    )
+}
+
+pub fn scan_sources_with_roots(
+    store: &Store,
+    days: i64,
+    codex_enabled: bool,
+    claude_enabled: bool,
+    since: Option<i64>,
+    codex_root: &Path,
+    claude_root: &Path,
 ) -> Result<ScanSummary, ScanError> {
     let cutoff = if days < 0 {
         0
@@ -61,7 +83,6 @@ pub fn scan_sources_with_options(
     };
 
     let activity_cutoff = since.unwrap_or(cutoff);
-    let codex_root = paths::codex_home();
     let codex_dirs = [
         codex_root.join("sessions"),
         codex_root.join("archived_sessions"),
@@ -100,7 +121,6 @@ pub fn scan_sources_with_options(
     }
     summary.sources.push(codex_source);
 
-    let claude_root = paths::claude_home();
     let mut claude_source = SourceSummary {
         provider: "claude-code".to_string(),
         root: sanitize_cwd(&claude_root.display().to_string()),
@@ -153,6 +173,7 @@ pub(crate) fn parse_claude_fixture(input: &str) -> Result<Vec<Activity>, String>
     .map(|parsed| parsed.activities)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_directory(
     store: &Store,
     provider: &str,
@@ -172,7 +193,15 @@ fn scan_directory(
             }
             !entry.file_name().to_string_lossy().starts_with("agent-")
         });
-    for entry in iter.filter_map(Result::ok) {
+    for entry in iter {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = error.path().unwrap_or(root);
+                record_scan_error(summary, source, provider, path, &error.to_string());
+                continue;
+            }
+        };
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|x| x.to_str()) != Some("jsonl")
         {
@@ -706,6 +735,10 @@ fn sanitize_cwd(value: &str) -> String {
     value.to_string()
 }
 
+pub fn display_source_root(path: &Path) -> String {
+    sanitize_cwd(&path.display().to_string())
+}
+
 fn is_internal_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.starts_with("<environment_context>")
@@ -727,7 +760,9 @@ fn stable_id(provider: &str, value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_claude, parse_codex, redact, scan_directory, scan_sources};
+    use super::{
+        parse_claude, parse_codex, redact, scan_directory, scan_sources, scan_sources_with_roots,
+    };
     use crate::models::{ScanSummary, SourceSummary};
     use crate::store::Store;
     use proptest::prelude::*;
@@ -885,6 +920,41 @@ mod tests {
         ).unwrap();
         assert_eq!(run(&store).new_activities, 1);
         assert_eq!(store.activity_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn configured_source_roots_are_used_instead_of_default_homes() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_root = dir.path().join("custom-codex");
+        let claude_root = dir.path().join("custom-claude");
+        fs::create_dir_all(codex_root.join("sessions")).unwrap();
+        fs::create_dir_all(claude_root.join("projects/project-a")).unwrap();
+        fs::write(
+            codex_root.join("sessions/custom.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-22T01:00:00Z","payload":{"id":"custom-codex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-22T01:01:00Z","payload":{"type":"user_message","message":"Custom Codex evidence"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            claude_root.join("projects/project-a/custom.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"custom-claude","timestamp":"2026-07-22T01:02:00Z","message":{"role":"user","content":"Custom Claude evidence"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let result =
+            scan_sources_with_roots(&store, 30, true, true, None, &codex_root, &claude_root)
+                .unwrap();
+        assert_eq!(result.new_activities, 2);
+        assert!(result.sources.iter().all(|source| source.available));
+        assert_eq!(store.provider_totals("codex").unwrap().1, 1);
+        assert_eq!(store.provider_totals("claude-code").unwrap().1, 1);
     }
 
     #[test]

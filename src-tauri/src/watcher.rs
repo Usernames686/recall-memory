@@ -1,7 +1,7 @@
-use crate::paths;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
@@ -21,9 +21,15 @@ struct SourceWatchErrorEvent {
     error: String,
 }
 
-pub fn start(app: AppHandle, activity_signal: Arc<Notify>) -> notify::Result<RecommendedWatcher> {
+pub fn start(
+    app: AppHandle,
+    activity_signal: Arc<Notify>,
+    codex_root: PathBuf,
+    claude_root: PathBuf,
+) -> notify::Result<RecommendedWatcher> {
     let callback_app = app.clone();
     let status_app = app.clone();
+    let callback_claude_root = claude_root.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
             let Ok(event) = result else { return };
@@ -31,7 +37,7 @@ pub fn start(app: AppHandle, activity_signal: Arc<Notify>) -> notify::Result<Rec
                 if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let provider = provider_for(&path);
+                let provider = provider_for(&path, &callback_claude_root);
                 activity_signal.notify_one();
                 let _ = callback_app.emit(
                     "source-dirty",
@@ -46,13 +52,13 @@ pub fn start(app: AppHandle, activity_signal: Arc<Notify>) -> notify::Result<Rec
     )?;
 
     for path in [
-        paths::codex_home().join("sessions"),
-        paths::codex_home().join("archived_sessions"),
-        paths::claude_home().join("projects"),
+        codex_root.join("sessions"),
+        codex_root.join("archived_sessions"),
+        claude_root.join("projects"),
     ] {
         if path.is_dir() {
             if let Err(error) = watcher.watch(&path, RecursiveMode::Recursive) {
-                let provider = provider_for(&path);
+                let provider = provider_for(&path, &claude_root);
                 let _ = status_app.emit(
                     "source-watch-error",
                     SourceWatchErrorEvent {
@@ -67,8 +73,8 @@ pub fn start(app: AppHandle, activity_signal: Arc<Notify>) -> notify::Result<Rec
     Ok(watcher)
 }
 
-fn provider_for(path: &Path) -> &'static str {
-    if path.starts_with(paths::claude_home()) {
+fn provider_for(path: &Path, claude_root: &Path) -> &'static str {
+    if path.starts_with(claude_root) {
         "claude-code"
     } else {
         "codex"

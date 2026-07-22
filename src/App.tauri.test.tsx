@@ -60,7 +60,7 @@ function snapshot(phase: EvolutionRunState["phase"] = "completed"): Snapshot {
     activityCount: 1,
     dirtyCount: 0,
     config: { provider: "remote", baseUrl: "https://api.example/v1", model: "mock-model", hasApiKey: true, contextMode: "guided", timeoutSeconds: 90, fallbackEnabled: true, fallbackBaseUrl: "http://127.0.0.1:11434/v1", fallbackModel: "qwen3:8b", fallbackTimeoutSeconds: 90, inputPricePerMillionUsd: 0, outputPricePerMillionUsd: 0, healthStatus: "ok" },
-    evolution: { enabled: true, codexEnabled: true, claudeEnabled: true, lookbackDays: 7, runMode: "manual", scheduleHours: 12, autoActivateLowRisk: false, maxAgentSteps: 6, launchAtLogin: false, notificationsEnabled: true, agentMode: "verification" },
+    evolution: { enabled: true, codexEnabled: true, claudeEnabled: true, lookbackDays: 7, runMode: "manual", scheduleHours: 12, autoActivateLowRisk: false, maxAgentSteps: 6, launchAtLogin: false, notificationsEnabled: true, agentMode: "verification", codexSourcePath: "/Users/test/.codex", claudeSourcePath: "/Users/test/.claude" },
     run,
     runHistory: [run],
     storeStats: { databasePath: "~/Recall/evolution.sqlite3", databaseBytes: 1024, entryCount: 1, activeCount: 0, pendingCount: 1, versionCount: 1, activityCount: 1, reflectedActivityCount: 0, runCount: 1, auditCount: 1 },
@@ -112,8 +112,9 @@ describe("Recall Memory Tauri workflows", () => {
     fireEvent.click(await screen.findByRole("button", { name: "设置" }))
     fireEvent.click(within(screen.getByLabelText("设置分类")).getByRole("button", { name: "数据源" }))
     fireEvent.click(screen.getByRole("button", { name: "30 天" }))
+    fireEvent.change(screen.getByLabelText("Codex 根目录"), { target: { value: "/Volumes/Agents/codex" } })
     fireEvent.click(screen.getByRole("button", { name: "保存设置" }))
-    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("save_evolution_settings", { input: expect.objectContaining({ lookbackDays: 30 }) }))
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("save_evolution_settings", { input: expect.objectContaining({ lookbackDays: 30, codexSourcePath: "/Volumes/Agents/codex" }) }))
 
     fireEvent.click(screen.getByRole("button", { name: "进化 Agent" }))
     fireEvent.click(screen.getByRole("button", { name: "测试连接" }))
@@ -165,5 +166,15 @@ describe("Recall Memory Tauri workflows", () => {
     expect(screen.getByText(/证据不足.*检测到重复.*未发现冲突/)).toBeInTheDocument()
     expect(screen.getByText("反对证据：activity-2")).toBeInTheDocument()
     expect(screen.getByText("Always run focused tests before the full build.")).toBeInTheDocument()
+  })
+
+  it("shows and dismisses a persisted Store recovery notice", async () => {
+    const current = { ...snapshot(), recoveryNotice: "检测到本地 Store 损坏，旧文件已隔离。" }
+    mockBackend(current)
+    render(<App />)
+
+    expect(await screen.findByText("检测到本地 Store 损坏，旧文件已隔离。")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "关闭恢复提示" }))
+    await waitFor(() => expect(runtime.invoke).toHaveBeenCalledWith("dismiss_recovery_notice", undefined))
   })
 })
