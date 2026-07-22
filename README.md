@@ -50,6 +50,12 @@ uses an ad-hoc identity when `APPLE_SIGNING_IDENTITY` is absent so the complete
 app bundle, including its MCP sidecar and resources, still passes strict
 `codesign` verification. Release CI keeps using its configured Developer ID.
 
+The desktop app checks the signed GitHub updater manifest on startup. Release
+CI requires `TAURI_SIGNING_PRIVATE_KEY` (and optionally its password), enables
+Tauri updater artifacts, generates `latest.json`, and publishes the signed
+`.app.tar.gz` alongside the DMG. The private updater key is never committed;
+the public key is embedded in `src-tauri/tauri.conf.json`.
+
 The default local model configuration is `http://127.0.0.1:11434/v1` with `qwen3:8b`. An OpenAI-compatible endpoint can be configured in the Settings page. API keys are stored in the macOS Keychain, not SQLite.
 
 ## Verification

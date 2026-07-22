@@ -10,6 +10,8 @@ Set the endpoint, model, and key only in the shell environment:
 export RECALL_REAL_MODEL_BASE_URL="https://your-gateway.example/v1"
 export RECALL_REAL_MODEL_ID="your-tool-calling-model"
 export RECALL_REAL_MODEL_API_KEY="..."
+# Optional, 10-300 seconds. Slow local models generally need the 300s default.
+export RECALL_REAL_MODEL_TIMEOUT_SECONDS="300"
 pnpm test:real-model
 ```
 

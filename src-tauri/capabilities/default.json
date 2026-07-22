@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main Recall window",
   "windows": ["main"],
-  "permissions": ["core:default", "autostart:default", "notification:default"]
+  "permissions": ["core:default", "autostart:default", "notification:default", "updater:default", "process:default"]
 }

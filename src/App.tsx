@@ -178,6 +178,8 @@ export default function App() {
   const [notice, setNotice] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const [liveTrace, setLiveTrace] = useState<AgentTraceEvent[]>([])
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null)
+  const [installingUpdate, setInstallingUpdate] = useState(false)
 
   const loadSnapshot = useCallback(async () => {
     setLoading(true)
@@ -201,6 +203,20 @@ export default function App() {
   }, [])
 
   useEffect(() => { void loadSnapshot() }, [loadSnapshot])
+
+  useEffect(() => {
+    if (!isTauri()) return
+    let active = true
+    void import("@tauri-apps/plugin-updater")
+      .then(({ check }) => check())
+      .then((update) => {
+        if (active && update) setUpdateVersion(update.version)
+      })
+      .catch(() => {
+        // Update checks are best effort; an unavailable manifest must not affect the app.
+      })
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     if (!isTauri()) return
@@ -289,6 +305,26 @@ export default function App() {
     if (result) setNotice({ tone: "success", text: result.message })
   }
 
+  const installUpdate = async () => {
+    if (!updateVersion || installingUpdate) return
+    setInstallingUpdate(true)
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater")
+      const update = await check()
+      if (!update) {
+        setUpdateVersion(null)
+        return
+      }
+      await update.downloadAndInstall()
+      const { relaunch } = await import("@tauri-apps/plugin-process")
+      await relaunch()
+    } catch (error) {
+      setNotice({ tone: "error", text: `更新失败：${errorText(error)}` })
+    } finally {
+      setInstallingUpdate(false)
+    }
+  }
+
   const maintenance = async (label: string, command: string, args?: Record<string, unknown>) => {
     const result = await runAction<MaintenanceResult>(label, command, args)
     if (result) setNotice({ tone: "success", text: result.path ? `${result.message}：${result.path}` : result.message })
@@ -323,6 +359,7 @@ export default function App() {
         <div className="breadcrumbs"><span>WORKSPACE</span><ChevronRight size={14} /><strong>{title}</strong></div>
         <div className="top-actions"><div className={`runtime-pill ${isTauri() ? "online" : "offline"}`}><span />{isTauri() ? phaseLabel[snapshot.run?.phase ?? (snapshot.evolution.runMode === "listener" ? "listening" : "idle")] : "浏览器预览"}</div><button className="icon-button" onClick={() => void loadSnapshot()} title="刷新数据" aria-label="刷新数据"><RefreshCw size={17} className={loading ? "spin" : ""} /></button><button className="avatar-button" title="本地安全存储" aria-label="本地安全存储"><LockKeyhole size={15} /></button></div>
       </header>
+      {updateVersion && <div className="notice info update-notice" role="status"><span><Download size={15} />发现 Recall Memory {updateVersion}</span><button className="button outline update-action" onClick={() => void installUpdate()} disabled={installingUpdate}>{installingUpdate ? "正在安装" : "安装更新"}</button><button onClick={() => setUpdateVersion(null)} aria-label="稍后更新"><X size={14} /></button></div>}
       {notice && <div className={`notice ${notice.tone}`} role="status"><span>{notice.tone === "success" ? <CircleCheck size={16} /> : notice.tone === "error" ? <CircleAlert size={16} /> : <Activity size={16} />}{notice.text}</span><button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={14} /></button></div>}
       <div className="page-wrap">
         {view === "overview" && <Overview snapshot={snapshot} active={activeEntries.length} pending={pendingEntries.length} onNavigate={setView} onRun={() => void runEvolution()} onAuthorize={() => void authorize()} onDismissRecovery={() => void runAction("dismiss-recovery", "dismiss_recovery_notice")} busy={busy} />}

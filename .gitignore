@@ -6,3 +6,4 @@ src-tauri/binaries/evolution-mcp-x86_64-apple-darwin
 src-tauri/binaries/evolution-mcp-universal-apple-darwin
 .DS_Store
 test-results/
+latest.json

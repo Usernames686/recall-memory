@@ -82,6 +82,10 @@ button:disabled { cursor: not-allowed; opacity: 0.48; }
 .notice.error > span { color: var(--down); }
 .notice.info > span { color: var(--amber); }
 .notice button { display: grid; place-items: center; width: 26px; height: 26px; margin-left: auto; background: transparent; border: 0; border-radius: 5px; cursor: pointer; }
+.notice.update-notice { top: 118px; }
+.notice.update-notice > span { display: inline-flex; align-items: center; gap: 6px; }
+.notice.update-notice .update-action { width: auto; height: 28px; min-height: 28px; margin-left: auto; padding: 0 9px; font-size: 10px; }
+.notice.update-notice > button:last-child { margin-left: 0; }
 
 .hero-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(300px, .7fr); align-items: center; min-height: 246px; padding: 0 2px 28px; gap: 36px; border-bottom: 1px solid var(--border); }
 .eyebrow, .panel-kicker, .status-label { margin: 0 0 9px; color: var(--accent); font-family: "Geist Mono", monospace; font-size: 9px; font-weight: 600; letter-spacing: .11em; }
@@ -160,6 +164,7 @@ h1, h2, h3, p { letter-spacing: 0; }
   .mobile-menu { display: grid; }.topbar { padding-inline: 12px; }.runtime-pill { display: none; }.page { padding: 23px 16px 42px; }.content-scroll { height: calc(100dvh - 56px); }
   .notice ~ .page-wrap { padding-top: 54px; }
   .notice { top: 62px; right: 16px; left: 16px; min-width: 0; max-width: none; }
+  .notice.update-notice { top: 112px; }
   .hero-row, .overview-grid, .reflection-layout, .connection-grid { grid-template-columns: 1fr; }.hero-row { gap: 24px; }.hero-status { min-height: 132px; }.page-intro { align-items: flex-start; gap: 16px; }.page-intro-action { margin-left: 0; }.provider-grid, .repo-grid { grid-template-columns: 1fr; }.table-head { display: none; }.table-row { grid-template-columns: minmax(0,1fr) 80px; min-height: 58px; }.table-row > span:nth-of-type(2) { display: none; }.table-row > span:last-child { text-align: right; }.consent-banner { grid-template-columns: 40px 1fr; }.consent-banner .button { grid-column: 1 / -1; }.next-step { grid-template-columns: 34px 1fr; }.next-step .button { grid-column: 1 / -1; }.boundary-list { grid-template-columns: 1fr; }
 }
 
