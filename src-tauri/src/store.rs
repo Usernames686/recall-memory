@@ -3870,6 +3870,23 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(backup.path.as_deref().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            let export = store.export_redacted_store().unwrap();
+            let export_mode = std::fs::metadata(export.path.as_deref().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(export_mode, 0o600);
+        }
         entry.summary = "after".into();
         entry.body = "after body".into();
         entry.updated_at = 2;

@@ -20,6 +20,11 @@ JSONL file. They contain only tool/action/status metadata and are compacted to a
 30-day, 10,000-record, 2 MiB bound. They are intentionally excluded from Active
 Store backup and restore.
 
+Local SQLite backups and redacted exports are not encrypted. On Unix systems
+Recall writes them with owner-only `0600` permissions inside its application
+data directory. Users who require encryption should keep that directory on an
+encrypted volume such as macOS FileVault.
+
 ## Development
 
 Requirements: macOS, Node.js, pnpm, and Rust.
