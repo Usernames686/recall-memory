@@ -4,6 +4,10 @@ pub const DEFAULT_CONTEXT_MODE: &str = "guided";
 pub const DEFAULT_AGENT_MODE: &str = "reflection";
 pub const DEFAULT_MODEL_PROVIDER: &str = "remote";
 pub const DEFAULT_MODEL_TIMEOUT_SECONDS: i64 = 90;
+pub const DEFAULT_INPUT_PRICE_PER_MILLION_USD: f64 = 0.0;
+pub const DEFAULT_OUTPUT_PRICE_PER_MILLION_USD: f64 = 0.0;
+pub const DEFAULT_FALLBACK_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+pub const DEFAULT_FALLBACK_MODEL: &str = "qwen3:8b";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +120,17 @@ pub struct McpStatus {
     pub codex: bool,
     pub claude: bool,
     pub last_checked: Option<i64>,
+    pub recent_calls: Vec<McpCallSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCallSummary {
+    pub id: i64,
+    pub occurred_at: i64,
+    pub tool_name: String,
+    pub action: Option<String>,
+    pub result_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -127,6 +142,14 @@ pub struct ReflectionConfigView {
     pub has_api_key: bool,
     pub context_mode: String,
     pub timeout_seconds: i64,
+    pub fallback_enabled: bool,
+    pub fallback_base_url: String,
+    pub fallback_model: String,
+    pub fallback_timeout_seconds: i64,
+    #[serde(default = "default_input_price_per_million_usd")]
+    pub input_price_per_million_usd: f64,
+    #[serde(default = "default_output_price_per_million_usd")]
+    pub output_price_per_million_usd: f64,
     pub health_status: String,
     pub health_error: Option<String>,
     pub last_checked_at: Option<i64>,
@@ -144,6 +167,18 @@ pub struct ReflectionConfigInput {
     pub context_mode: Option<String>,
     #[serde(default = "default_model_timeout_seconds")]
     pub timeout_seconds: i64,
+    #[serde(default = "default_true")]
+    pub fallback_enabled: bool,
+    #[serde(default = "default_fallback_base_url")]
+    pub fallback_base_url: String,
+    #[serde(default = "default_fallback_model")]
+    pub fallback_model: String,
+    #[serde(default = "default_model_timeout_seconds")]
+    pub fallback_timeout_seconds: i64,
+    #[serde(default = "default_input_price_per_million_usd")]
+    pub input_price_per_million_usd: f64,
+    #[serde(default = "default_output_price_per_million_usd")]
+    pub output_price_per_million_usd: f64,
 }
 
 fn default_model_provider() -> String {
@@ -152,6 +187,62 @@ fn default_model_provider() -> String {
 
 fn default_model_timeout_seconds() -> i64 {
     DEFAULT_MODEL_TIMEOUT_SECONDS
+}
+
+fn default_fallback_base_url() -> String {
+    DEFAULT_FALLBACK_BASE_URL.to_string()
+}
+
+fn default_fallback_model() -> String {
+    DEFAULT_FALLBACK_MODEL.to_string()
+}
+
+fn default_input_price_per_million_usd() -> f64 {
+    DEFAULT_INPUT_PRICE_PER_MILLION_USD
+}
+
+fn default_output_price_per_million_usd() -> f64 {
+    DEFAULT_OUTPUT_PRICE_PER_MILLION_USD
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerConfigSnapshot {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub timeout_seconds: i64,
+    pub agent_mode: String,
+    pub auto_activate_low_risk: bool,
+    pub max_agent_steps: i64,
+    pub fallback_enabled: bool,
+    pub fallback_base_url: String,
+    pub fallback_model: String,
+    pub fallback_timeout_seconds: i64,
+    #[serde(default = "default_input_price_per_million_usd")]
+    pub input_price_per_million_usd: f64,
+    #[serde(default = "default_output_price_per_million_usd")]
+    pub output_price_per_million_usd: f64,
+}
+
+impl RunnerConfigSnapshot {
+    pub fn from_views(config: &ReflectionConfigView, settings: &EvolutionSettingsView) -> Self {
+        Self {
+            provider: config.provider.clone(),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            timeout_seconds: config.timeout_seconds,
+            agent_mode: settings.agent_mode.clone(),
+            auto_activate_low_risk: settings.auto_activate_low_risk,
+            max_agent_steps: settings.max_agent_steps,
+            fallback_enabled: config.fallback_enabled,
+            fallback_base_url: config.fallback_base_url.clone(),
+            fallback_model: config.fallback_model.clone(),
+            fallback_timeout_seconds: config.fallback_timeout_seconds,
+            input_price_per_million_usd: config.input_price_per_million_usd,
+            output_price_per_million_usd: config.output_price_per_million_usd,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +258,37 @@ pub struct ReflectionRunResult {
     pub verification_status: String,
     #[serde(default)]
     pub verification_summary: Option<String>,
+    #[serde(default)]
+    pub candidate_verifications: Vec<CandidateVerification>,
+    #[serde(default)]
+    pub provider_used: String,
+    #[serde(default)]
+    pub fallback_count: i64,
+    #[serde(default)]
+    pub input_activity_count: i64,
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateVerification {
+    pub run_id: String,
+    pub entry_id: String,
+    pub evidence_sufficient: bool,
+    pub supporting_evidence: Vec<String>,
+    pub contradicting_evidence: Vec<String>,
+    pub confidence: f64,
+    pub duplicate: bool,
+    pub conflict: bool,
+    pub recommendation: String,
+    pub rationale: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +366,22 @@ pub struct EvolutionRunState {
     pub verification_status: String,
     #[serde(default)]
     pub verification_summary: Option<String>,
+    #[serde(default)]
+    pub retry_of_run_id: Option<String>,
+    #[serde(default)]
+    pub provider_used: Option<String>,
+    #[serde(default)]
+    pub fallback_count: i64,
+    #[serde(default)]
+    pub input_activity_count: i64,
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +406,7 @@ pub struct EvolutionRunDetail {
     pub activities: Vec<Activity>,
     pub entries: Vec<EvolutionEntry>,
     pub traces: Vec<AgentTraceEvent>,
+    pub candidate_verifications: Vec<CandidateVerification>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

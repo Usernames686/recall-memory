@@ -92,6 +92,14 @@ export interface EvolutionRunState {
   traceCount: number
   verificationStatus: "not_run" | "passed" | "review_required" | "failed" | string
   verificationSummary?: string
+  retryOfRunId?: string
+  providerUsed?: string
+  fallbackCount: number
+  inputActivityCount: number
+  inputTokens: number
+  outputTokens: number
+  durationMs: number
+  estimatedCostUsd?: number
 }
 
 export interface AgentTraceEvent {
@@ -112,6 +120,20 @@ export interface EvolutionRunDetail {
   activities: Activity[]
   entries: EvolutionEntry[]
   traces: AgentTraceEvent[]
+  candidateVerifications: CandidateVerification[]
+}
+
+export interface CandidateVerification {
+  runId: string
+  entryId: string
+  evidenceSufficient: boolean
+  supportingEvidence: string[]
+  contradictingEvidence: string[]
+  confidence: number
+  duplicate: boolean
+  conflict: boolean
+  recommendation: "approve" | "review" | "reject"
+  rationale: string
 }
 
 export interface ReflectionConfig {
@@ -121,9 +143,30 @@ export interface ReflectionConfig {
   hasApiKey: boolean
   contextMode: ContextMode
   timeoutSeconds: number
+  fallbackEnabled: boolean
+  fallbackBaseUrl: string
+  fallbackModel: string
+  fallbackTimeoutSeconds: number
+  inputPricePerMillionUsd: number
+  outputPricePerMillionUsd: number
   healthStatus: "unknown" | "checking" | "ok" | "error"
   healthError?: string
   lastCheckedAt?: number
+}
+
+export interface ReflectionConfigInput {
+  provider: ModelProvider
+  baseUrl: string
+  model: string
+  apiKey?: string
+  contextMode: ContextMode
+  timeoutSeconds: number
+  fallbackEnabled: boolean
+  fallbackBaseUrl: string
+  fallbackModel: string
+  fallbackTimeoutSeconds: number
+  inputPricePerMillionUsd: number
+  outputPricePerMillionUsd: number
 }
 
 export interface Snapshot {
@@ -150,7 +193,16 @@ export interface Snapshot {
     codex: boolean
     claude: boolean
     lastChecked?: number
+    recentCalls: McpCallSummary[]
   }
+}
+
+export interface McpCallSummary {
+  id: number
+  occurredAt: number
+  toolName: string
+  action?: string
+  resultStatus: string
 }
 
 export interface EntryVersion {
@@ -255,4 +307,11 @@ export interface ReflectionResult {
   pending: number
   discarded: number
   message: string
+  providerUsed: string
+  fallbackCount: number
+  inputActivityCount: number
+  inputTokens: number
+  outputTokens: number
+  durationMs: number
+  estimatedCostUsd?: number
 }

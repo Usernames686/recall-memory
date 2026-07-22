@@ -1,16 +1,20 @@
 use crate::models::{
-    Activity, AgentTraceEvent, AuditEvent, CacheCleanupPreview, EntryVersion, EntryVersionDiff,
-    EvolutionEntry, EvolutionRunDetail, EvolutionRunState, EvolutionSettingsInput,
-    EvolutionSettingsView, MaintenanceResult, RedactionCategoryCount, RedactionReport,
-    ReflectionConfigView, ReflectionRunResult, RunRollbackResult, SessionSummary, StoreBackup,
-    StoreStats, DEFAULT_AGENT_MODE, DEFAULT_CONTEXT_MODE, DEFAULT_MODEL_PROVIDER,
-    DEFAULT_MODEL_TIMEOUT_SECONDS,
+    Activity, AgentTraceEvent, AuditEvent, CacheCleanupPreview, CandidateVerification,
+    EntryVersion, EntryVersionDiff, EvolutionEntry, EvolutionRunDetail, EvolutionRunState,
+    EvolutionSettingsInput, EvolutionSettingsView, MaintenanceResult, McpCallSummary,
+    RedactionCategoryCount, RedactionReport, ReflectionConfigView, ReflectionRunResult,
+    RunRollbackResult, RunnerConfigSnapshot, SessionSummary, StoreBackup, StoreStats,
+    DEFAULT_AGENT_MODE, DEFAULT_CONTEXT_MODE, DEFAULT_FALLBACK_BASE_URL, DEFAULT_FALLBACK_MODEL,
+    DEFAULT_INPUT_PRICE_PER_MILLION_USD, DEFAULT_MODEL_PROVIDER, DEFAULT_MODEL_TIMEOUT_SECONDS,
+    DEFAULT_OUTPUT_PRICE_PER_MILLION_USD,
 };
 use crate::paths;
+use regex::Regex;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -29,6 +33,8 @@ pub struct Store {
     path: std::path::PathBuf,
 }
 
+const CURRENT_SCHEMA_VERSION: i64 = 4;
+
 #[derive(Debug, Clone)]
 pub struct ScanCursor {
     pub size: i64,
@@ -41,13 +47,17 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)?;
+        let mut conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 3000)?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS activities (
                 id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
@@ -134,7 +144,16 @@ impl Store {
                 agent_mode TEXT NOT NULL DEFAULT 'reflection',
                 trace_count INTEGER NOT NULL DEFAULT 0,
                 verification_status TEXT NOT NULL DEFAULT 'not_run',
-                verification_summary TEXT
+                verification_summary TEXT,
+                retry_of_run_id TEXT,
+                runner_config_json TEXT NOT NULL DEFAULT '{}',
+                provider_used TEXT,
+                fallback_count INTEGER NOT NULL DEFAULT 0,
+                input_activity_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                model_duration_ms INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL
             );
             CREATE TABLE IF NOT EXISTS agent_trace_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +169,21 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS agent_trace_events_run_idx
                 ON agent_trace_events(run_id, occurred_at, id);
+            CREATE TABLE IF NOT EXISTS candidate_verifications (
+                run_id TEXT NOT NULL,
+                entry_id TEXT NOT NULL,
+                evidence_sufficient INTEGER NOT NULL,
+                supporting_evidence_json TEXT NOT NULL,
+                contradicting_evidence_json TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                duplicate INTEGER NOT NULL,
+                conflict INTEGER NOT NULL,
+                recommendation TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                PRIMARY KEY(run_id, entry_id)
+            );
+            CREATE INDEX IF NOT EXISTS candidate_verifications_entry_idx
+                ON candidate_verifications(entry_id, run_id);
             CREATE TABLE IF NOT EXISTS evolution_run_activities (
                 run_id TEXT NOT NULL,
                 activity_id TEXT NOT NULL,
@@ -177,68 +211,18 @@ impl Store {
                 object_id TEXT,
                 detail_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS mcp_call_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                action TEXT,
+                result_status TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS mcp_call_log_time_idx
+                ON mcp_call_log(occurred_at DESC, id DESC);
             ",
         )?;
-        if !has_column(&conn, "activities", "reflected_at")? {
-            conn.execute("ALTER TABLE activities ADD COLUMN reflected_at INTEGER", [])?;
-        }
-        if !has_column(&conn, "entries", "origin_run_id")? {
-            conn.execute("ALTER TABLE entries ADD COLUMN origin_run_id TEXT", [])?;
-        }
-        if !has_column(&conn, "entries", "target_entry_id")? {
-            conn.execute("ALTER TABLE entries ADD COLUMN target_entry_id TEXT", [])?;
-        }
-        if !has_column(&conn, "entries", "version")? {
-            conn.execute(
-                "ALTER TABLE entries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
-                [],
-            )?;
-        }
-        for (column, definition) in [
-            ("source_run_id", "TEXT"),
-            ("reviewer", "TEXT"),
-            ("review_reason", "TEXT"),
-            ("reviewed_at", "INTEGER"),
-        ] {
-            if !has_column(&conn, "entry_versions", column)? {
-                conn.execute(
-                    &format!("ALTER TABLE entry_versions ADD COLUMN {column} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        if !has_column(&conn, "scan_cursors", "oldest_activity_at")? {
-            conn.execute(
-                "ALTER TABLE scan_cursors ADD COLUMN oldest_activity_at INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        for (column, definition) in [
-            ("model", "TEXT"),
-            ("providers_json", "TEXT NOT NULL DEFAULT '[]'"),
-            ("lookback_days", "INTEGER NOT NULL DEFAULT 30"),
-            ("rolled_back_at", "INTEGER"),
-            ("agent_mode", "TEXT NOT NULL DEFAULT 'reflection'"),
-            ("trace_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("verification_status", "TEXT NOT NULL DEFAULT 'not_run'"),
-            ("verification_summary", "TEXT"),
-        ] {
-            if !has_column(&conn, "evolution_runs", column)? {
-                conn.execute(
-                    &format!("ALTER TABLE evolution_runs ADD COLUMN {column} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO entry_versions
-             (entry_id, version, kind, title, summary, body, status, risk, source_refs_json,
-              origin_run_id, target_entry_id, created_at, action, source_run_id)
-             SELECT id, version, kind, title, summary, body, status, risk, source_refs_json,
-                    origin_run_id, target_entry_id, updated_at, 'migration', origin_run_id
-             FROM entries",
-            [],
-        )?;
+        run_migrations(&mut conn)?;
         Ok(Self { conn, path })
     }
 
@@ -569,6 +553,37 @@ impl Store {
         Ok(())
     }
 
+    pub fn append_mcp_call(
+        &self,
+        tool_name: &str,
+        action: Option<&str>,
+        result_status: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO mcp_call_log(occurred_at, tool_name, action, result_status)
+             VALUES (unixepoch(), ?1, ?2, ?3)",
+            params![tool_name, action, result_status],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_mcp_calls(&self, limit: i64) -> Result<Vec<McpCallSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, occurred_at, tool_name, action, result_status
+             FROM mcp_call_log ORDER BY occurred_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit.clamp(1, 100)], |row| {
+            Ok(McpCallSummary {
+                id: row.get(0)?,
+                occurred_at: row.get(1)?,
+                tool_name: row.get(2)?,
+                action: row.get(3)?,
+                result_status: row.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, provider, title, source_path, cwd, activity_count, updated_at
@@ -851,6 +866,79 @@ impl Store {
         Ok(())
     }
 
+    pub fn start_evolution_run_with_snapshot(
+        &self,
+        run_id: &str,
+        mode: &str,
+        model: Option<&str>,
+        providers: &[String],
+        lookback_days: i64,
+        snapshot: &RunnerConfigSnapshot,
+        retry_of_run_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if !matches!(snapshot.agent_mode.as_str(), "reflection" | "verification") {
+            return Err(StoreError::InvalidSetting("invalid agent mode".into()));
+        }
+        self.conn.execute(
+            "INSERT INTO evolution_runs
+             (id, mode, phase, started_at, model, providers_json, lookback_days, agent_mode,
+              retry_of_run_id, runner_config_json)
+             VALUES (?1, ?2, 'scanning', unixepoch(), ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                mode,
+                model,
+                serde_json::to_string(providers)?,
+                lookback_days,
+                snapshot.agent_mode,
+                retry_of_run_id,
+                serde_json::to_string(snapshot)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn evolution_run_config_snapshot(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunnerConfigSnapshot>, StoreError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT runner_config_json FROM evolution_runs WHERE id=?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match raw.as_deref().map(str::trim) {
+            None | Some("") | Some("{}") => Ok(None),
+            Some(value) => Ok(Some(serde_json::from_str(value)?)),
+        }
+    }
+
+    pub fn set_run_model_usage(
+        &self,
+        run_id: &str,
+        result: &ReflectionRunResult,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE evolution_runs SET provider_used=?2, fallback_count=?3,
+             input_activity_count=?4, input_tokens=?5, output_tokens=?6,
+             model_duration_ms=?7, estimated_cost_usd=?8 WHERE id=?1",
+            params![
+                run_id,
+                result.provider_used,
+                result.fallback_count.max(0),
+                result.input_activity_count.max(0),
+                result.input_tokens.max(0),
+                result.output_tokens.max(0),
+                result.duration_ms.max(0),
+                result.estimated_cost_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_verification(
         &self,
         run_id: &str,
@@ -875,12 +963,22 @@ impl Store {
         pending: i64,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
+        let sanitized_error = error.map(sanitize_stored_error);
         self.conn.execute(
             "UPDATE evolution_runs SET phase=?2, scanned_activities=?3, consumed_activities=?4,
              generated=?5, activated=?6, pending=?7,
              completed_at=CASE WHEN ?2 IN ('completed','failed','cancelled','interrupted') THEN unixepoch() ELSE completed_at END,
              error=?8 WHERE id=?1",
-            params![run_id, phase, scanned, consumed, generated, activated, pending, error],
+            params![
+                run_id,
+                phase,
+                scanned,
+                consumed,
+                generated,
+                activated,
+                pending,
+                sanitized_error
+            ],
         )?;
         Ok(())
     }
@@ -892,7 +990,10 @@ impl Store {
                 "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                         consumed_activities, generated, activated, pending, error,
                         model, providers_json, lookback_days, rolled_back_at,
-                        agent_mode, trace_count, verification_status, verification_summary
+                        agent_mode, trace_count, verification_status, verification_summary,
+                        retry_of_run_id, provider_used, fallback_count,
+                        input_activity_count, input_tokens, output_tokens,
+                        model_duration_ms, estimated_cost_usd
                  FROM evolution_runs ORDER BY started_at DESC LIMIT 1",
                 [],
                 read_evolution_run,
@@ -906,7 +1007,10 @@ impl Store {
             "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                     consumed_activities, generated, activated, pending, error,
                     model, providers_json, lookback_days, rolled_back_at,
-                    agent_mode, trace_count, verification_status, verification_summary
+                    agent_mode, trace_count, verification_status, verification_summary,
+                    retry_of_run_id, provider_used, fallback_count,
+                    input_activity_count, input_tokens, output_tokens,
+                    model_duration_ms, estimated_cost_usd
              FROM evolution_runs ORDER BY started_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], read_evolution_run)?;
@@ -920,7 +1024,10 @@ impl Store {
                 "SELECT id, mode, phase, started_at, completed_at, scanned_activities,
                         consumed_activities, generated, activated, pending, error,
                         model, providers_json, lookback_days, rolled_back_at,
-                        agent_mode, trace_count, verification_status, verification_summary
+                        agent_mode, trace_count, verification_status, verification_summary,
+                        retry_of_run_id, provider_used, fallback_count,
+                        input_activity_count, input_tokens, output_tokens,
+                        model_duration_ms, estimated_cost_usd
                  FROM evolution_runs WHERE id=?1",
                 [run_id],
                 read_evolution_run,
@@ -937,7 +1044,37 @@ impl Store {
             activities: self.evolution_run_activities(run_id)?,
             entries,
             traces: self.list_trace_events(run_id, 500)?,
+            candidate_verifications: self.candidate_verifications_for_run(run_id)?,
         })
+    }
+
+    pub fn candidate_verifications_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<CandidateVerification>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, entry_id, evidence_sufficient, supporting_evidence_json,
+                    contradicting_evidence_json, confidence, duplicate, conflict,
+                    recommendation, rationale
+             FROM candidate_verifications WHERE run_id=?1 ORDER BY entry_id",
+        )?;
+        let rows = stmt.query_map([run_id], |row| {
+            let supporting: String = row.get(3)?;
+            let contradicting: String = row.get(4)?;
+            Ok(CandidateVerification {
+                run_id: row.get(0)?,
+                entry_id: row.get(1)?,
+                evidence_sufficient: row.get(2)?,
+                supporting_evidence: serde_json::from_str(&supporting).unwrap_or_default(),
+                contradicting_evidence: serde_json::from_str(&contradicting).unwrap_or_default(),
+                confidence: row.get(5)?,
+                duplicate: row.get(6)?,
+                conflict: row.get(7)?,
+                recommendation: row.get(8)?,
+                rationale: row.get(9)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn append_trace_event(
@@ -1373,11 +1510,14 @@ impl Store {
         self.conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
         let directory = self.backups_directory();
         fs::create_dir_all(&directory)?;
+        let now = chrono::Utc::now();
         let path = directory.join(format!(
-            "recall-{}.sqlite3",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            "recall-{}-{:09}.sqlite3",
+            now.format("%Y%m%d-%H%M%S"),
+            now.timestamp_subsec_nanos()
         ));
         fs::copy(&self.path, &path)?;
+        restrict_file_permissions(&path)?;
         self.append_audit(
             "store_backup_created",
             None,
@@ -1439,6 +1579,11 @@ impl Store {
                 "backup must be inside the Recall backups directory".into(),
             ));
         }
+
+        // Keep a recoverable snapshot of the current Active Store before any
+        // destructive replacement. The original sessions and run history are
+        // intentionally left untouched by restore.
+        let pre_restore_backup = self.backup_store()?;
 
         let backup = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let integrity: String = backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -1505,6 +1650,7 @@ impl Store {
                  VALUES (unixepoch(), 'active_store_restored', NULL, ?1)",
                 [serde_json::to_string(&serde_json::json!({
                     "backup": file_name,
+                    "preRestoreBackup": pre_restore_backup.path,
                     "restoredEntries": affected,
                     "actor": "local-user"
                 }))?],
@@ -1581,6 +1727,7 @@ impl Store {
         });
         sanitize_export_paths(&mut payload);
         fs::write(&path, serde_json::to_vec_pretty(&payload)?)?;
+        restrict_file_permissions(&path)?;
         self.append_audit(
             "redacted_store_exported",
             None,
@@ -1662,17 +1809,60 @@ impl Store {
                 .optional()?
                 .unwrap_or_default())
         };
-        let has_key = keyring::Entry::new("recall-evolution", "reflection-api")
-            .ok()
-            .and_then(|entry| entry.get_password().ok())
-            .is_some();
+        let has_key = keyring::Entry::new(
+            "recall-evolution",
+            &crate::keyring_account(
+                match get("provider")?.as_str() {
+                    "ollama" => "ollama",
+                    _ => DEFAULT_MODEL_PROVIDER,
+                },
+                &get("base_url")?,
+            ),
+        )
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .is_some();
+        let provider = match get("provider")?.as_str() {
+            "ollama" => "ollama".to_string(),
+            _ => DEFAULT_MODEL_PROVIDER.to_string(),
+        };
+        let base_url = get("base_url")?;
+        let model = get("model")?;
+        let fallback_enabled = match get("fallback_enabled")?.as_str() {
+            "false" | "0" => false,
+            _ => true,
+        };
+        let fallback_base_url = match get("fallback_base_url")? {
+            value if value.trim().is_empty() => DEFAULT_FALLBACK_BASE_URL.to_string(),
+            value => value,
+        };
+        let fallback_model = match get("fallback_model")? {
+            value if value.trim().is_empty() => DEFAULT_FALLBACK_MODEL.to_string(),
+            value => value,
+        };
+        let input_price_per_million_usd = get("input_price_per_million_usd")?
+            .parse::<f64>()
+            .unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION_USD)
+            .clamp(0.0, 10_000.0);
+        let output_price_per_million_usd = get("output_price_per_million_usd")?
+            .parse::<f64>()
+            .unwrap_or(DEFAULT_OUTPUT_PRICE_PER_MILLION_USD)
+            .clamp(0.0, 10_000.0);
+        let health_matches = get("health_provider")? == provider
+            && get("health_base_url")? == base_url
+            && get("health_model")? == model;
+        let health_status = if health_matches {
+            match get("health_status")?.as_str() {
+                "ok" | "error" | "checking" => get("health_status")?,
+                _ => "unknown".to_string(),
+            }
+        } else {
+            "unknown".to_string()
+        };
         Ok(ReflectionConfigView {
-            provider: match get("provider")?.as_str() {
-                "ollama" => "ollama".to_string(),
-                _ => DEFAULT_MODEL_PROVIDER.to_string(),
-            },
-            base_url: get("base_url")?,
-            model: get("model")?,
+            provider,
+            base_url,
+            model,
             has_api_key: has_key,
             context_mode: match get("context_mode")?.as_str() {
                 "mcp" => "mcp".to_string(),
@@ -1682,11 +1872,23 @@ impl Store {
                 .parse::<i64>()
                 .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS)
                 .clamp(10, 300),
-            health_status: match get("health_status")?.as_str() {
-                "ok" | "error" | "checking" => get("health_status")?,
-                _ => "unknown".to_string(),
-            },
-            health_error: match get("health_error")?.trim() {
+            fallback_enabled,
+            fallback_base_url,
+            fallback_model,
+            fallback_timeout_seconds: get("fallback_timeout_seconds")?
+                .parse::<i64>()
+                .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS)
+                .clamp(10, 300),
+            input_price_per_million_usd,
+            output_price_per_million_usd,
+            health_status,
+            health_error: match if health_matches {
+                get("health_error")?
+            } else {
+                String::new()
+            }
+            .trim()
+            {
                 "" => None,
                 value => Some(value.chars().take(240).collect()),
             },
@@ -1834,6 +2036,62 @@ impl Store {
         context_mode: &str,
         timeout_seconds: i64,
     ) -> Result<(), StoreError> {
+        self.save_config_with_fallback(
+            provider,
+            base_url,
+            model,
+            context_mode,
+            timeout_seconds,
+            true,
+            DEFAULT_FALLBACK_BASE_URL,
+            DEFAULT_FALLBACK_MODEL,
+            DEFAULT_MODEL_TIMEOUT_SECONDS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_config_with_fallback(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        context_mode: &str,
+        timeout_seconds: i64,
+        fallback_enabled: bool,
+        fallback_base_url: &str,
+        fallback_model: &str,
+        fallback_timeout_seconds: i64,
+    ) -> Result<(), StoreError> {
+        self.save_config_with_fallback_and_pricing(
+            provider,
+            base_url,
+            model,
+            context_mode,
+            timeout_seconds,
+            fallback_enabled,
+            fallback_base_url,
+            fallback_model,
+            fallback_timeout_seconds,
+            DEFAULT_INPUT_PRICE_PER_MILLION_USD,
+            DEFAULT_OUTPUT_PRICE_PER_MILLION_USD,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_config_with_fallback_and_pricing(
+        &self,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        context_mode: &str,
+        timeout_seconds: i64,
+        fallback_enabled: bool,
+        fallback_base_url: &str,
+        fallback_model: &str,
+        fallback_timeout_seconds: i64,
+        input_price_per_million_usd: f64,
+        output_price_per_million_usd: f64,
+    ) -> Result<(), StoreError> {
         if !matches!(provider, "remote" | "ollama") {
             return Err(StoreError::InvalidSetting("invalid model provider".into()));
         }
@@ -1842,12 +2100,49 @@ impl Store {
                 "timeout_seconds must be 10..300".into(),
             ));
         }
-        let values = [
+        if !(10..=300).contains(&fallback_timeout_seconds) {
+            return Err(StoreError::InvalidSetting(
+                "fallback_timeout_seconds must be 10..300".into(),
+            ));
+        }
+        if fallback_enabled
+            && (fallback_base_url.trim().is_empty() || fallback_model.trim().is_empty())
+        {
+            return Err(StoreError::InvalidSetting(
+                "fallback URL and model are required when enabled".into(),
+            ));
+        }
+        if !input_price_per_million_usd.is_finite()
+            || !(0.0..=10_000.0).contains(&input_price_per_million_usd)
+            || !output_price_per_million_usd.is_finite()
+            || !(0.0..=10_000.0).contains(&output_price_per_million_usd)
+        {
+            return Err(StoreError::InvalidSetting(
+                "model prices must be finite values between 0 and 10000 USD per million tokens"
+                    .into(),
+            ));
+        }
+        let values = vec![
             ("provider", provider.to_string()),
             ("base_url", base_url.to_string()),
             ("model", model.to_string()),
             ("context_mode", context_mode.to_string()),
             ("timeout_seconds", timeout_seconds.to_string()),
+            ("fallback_enabled", fallback_enabled.to_string()),
+            ("fallback_base_url", fallback_base_url.to_string()),
+            ("fallback_model", fallback_model.to_string()),
+            (
+                "fallback_timeout_seconds",
+                fallback_timeout_seconds.to_string(),
+            ),
+            (
+                "input_price_per_million_usd",
+                input_price_per_million_usd.to_string(),
+            ),
+            (
+                "output_price_per_million_usd",
+                output_price_per_million_usd.to_string(),
+            ),
         ];
         for (key, value) in values {
             self.conn.execute(
@@ -1860,9 +2155,39 @@ impl Store {
     }
 
     pub fn mark_model_health(&self, status: &str, error: Option<&str>) -> Result<(), StoreError> {
+        let read = |key: &str| -> Result<String, rusqlite::Error> {
+            Ok(self
+                .conn
+                .query_row("SELECT value FROM config WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .unwrap_or_default())
+        };
+        self.mark_model_health_for(
+            status,
+            error,
+            &read("provider")?,
+            &read("base_url")?,
+            &read("model")?,
+        )
+    }
+
+    pub fn mark_model_health_for(
+        &self,
+        status: &str,
+        error: Option<&str>,
+        provider: &str,
+        base_url: &str,
+        model: &str,
+    ) -> Result<(), StoreError> {
+        let sanitized_error = error.map(sanitize_stored_error).unwrap_or_default();
         for (key, value) in [
             ("health_status", status.to_string()),
-            ("health_error", error.unwrap_or_default().to_string()),
+            ("health_error", sanitized_error),
+            ("health_provider", provider.to_string()),
+            ("health_base_url", base_url.to_string()),
+            ("health_model", model.to_string()),
             (
                 "last_checked_at",
                 chrono::Utc::now().timestamp().to_string(),
@@ -1903,6 +2228,27 @@ fn write_reflection_result(
                     "risk": entry.risk,
                     "sources": entry.source_refs.len()
                 }))?
+            ],
+        )?;
+    }
+    for verification in &result.candidate_verifications {
+        tx.execute(
+            "INSERT OR REPLACE INTO candidate_verifications
+             (run_id, entry_id, evidence_sufficient, supporting_evidence_json,
+              contradicting_evidence_json, confidence, duplicate, conflict,
+              recommendation, rationale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                verification.run_id,
+                verification.entry_id,
+                verification.evidence_sufficient,
+                serde_json::to_string(&verification.supporting_evidence)?,
+                serde_json::to_string(&verification.contradicting_evidence)?,
+                verification.confidence,
+                verification.duplicate,
+                verification.conflict,
+                verification.recommendation,
+                verification.rationale,
             ],
         )?;
     }
@@ -2061,7 +2407,119 @@ fn read_evolution_run(row: &Row<'_>) -> rusqlite::Result<EvolutionRunState> {
             .get::<_, Option<String>>(17)?
             .unwrap_or_else(|| "not_run".to_string()),
         verification_summary: row.get(18)?,
+        retry_of_run_id: row.get(19)?,
+        provider_used: row.get(20)?,
+        fallback_count: row.get::<_, Option<i64>>(21)?.unwrap_or_default(),
+        input_activity_count: row.get::<_, Option<i64>>(22)?.unwrap_or_default(),
+        input_tokens: row.get::<_, Option<i64>>(23)?.unwrap_or_default(),
+        output_tokens: row.get::<_, Option<i64>>(24)?.unwrap_or_default(),
+        duration_ms: row.get::<_, Option<i64>>(25)?.unwrap_or_default(),
+        estimated_cost_usd: row.get(26)?,
     })
+}
+
+fn run_migrations(conn: &mut Connection) -> Result<(), StoreError> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidSetting(format!(
+            "database schema {} is newer than supported {}",
+            current, CURRENT_SCHEMA_VERSION
+        )));
+    }
+    for version in (current + 1)..=CURRENT_SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        match version {
+            1 => {
+                add_column_if_missing_tx(&tx, "activities", "reflected_at", "INTEGER")?;
+                add_column_if_missing_tx(&tx, "entries", "origin_run_id", "TEXT")?;
+                add_column_if_missing_tx(&tx, "entries", "target_entry_id", "TEXT")?;
+                add_column_if_missing_tx(&tx, "entries", "version", "INTEGER NOT NULL DEFAULT 1")?;
+                for (column, definition) in [
+                    ("source_run_id", "TEXT"),
+                    ("reviewer", "TEXT"),
+                    ("review_reason", "TEXT"),
+                    ("reviewed_at", "INTEGER"),
+                ] {
+                    add_column_if_missing_tx(&tx, "entry_versions", column, definition)?;
+                }
+                add_column_if_missing_tx(
+                    &tx,
+                    "scan_cursors",
+                    "oldest_activity_at",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            2 => {
+                for (column, definition) in [
+                    ("model", "TEXT"),
+                    ("providers_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("lookback_days", "INTEGER NOT NULL DEFAULT 30"),
+                    ("rolled_back_at", "INTEGER"),
+                    ("agent_mode", "TEXT NOT NULL DEFAULT 'reflection'"),
+                    ("trace_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("verification_status", "TEXT NOT NULL DEFAULT 'not_run'"),
+                    ("verification_summary", "TEXT"),
+                ] {
+                    add_column_if_missing_tx(&tx, "evolution_runs", column, definition)?;
+                }
+            }
+            3 => {
+                for (column, definition) in [
+                    ("retry_of_run_id", "TEXT"),
+                    ("runner_config_json", "TEXT NOT NULL DEFAULT '{}'"),
+                    ("provider_used", "TEXT"),
+                    ("fallback_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("input_activity_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("model_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                    ("estimated_cost_usd", "REAL"),
+                ] {
+                    add_column_if_missing_tx(&tx, "evolution_runs", column, definition)?;
+                }
+            }
+            4 => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO entry_versions
+                     (entry_id, version, kind, title, summary, body, status, risk, source_refs_json,
+                      origin_run_id, target_entry_id, created_at, action, source_run_id)
+                     SELECT id, version, kind, title, summary, body, status, risk, source_refs_json,
+                            origin_run_id, target_entry_id, updated_at, 'migration', origin_run_id
+                     FROM entries",
+                    [],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_migrations(version, applied_at)
+             VALUES (?1, unixepoch())",
+            [version],
+        )?;
+        tx.commit()?;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    Ok(())
+}
+
+fn add_column_if_missing_tx(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), StoreError> {
+    let exists: bool = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
+        [column],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        tx.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
@@ -2078,10 +2536,14 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusq
 fn sanitize_export_paths(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
-            if text.contains("/Users/") || text.contains("\\Users\\") || text.starts_with("file://")
-            {
-                *text = "[REDACTED_LOCAL_PATH]".to_string();
-            }
+            static LOCAL_PATHS: OnceLock<Regex> = OnceLock::new();
+            let paths = LOCAL_PATHS.get_or_init(|| {
+                Regex::new(
+                    r#"(?x)(?:file://)?(?:/(?:Users|home|private|var|tmp|Volumes)/[^\s\"'<>]+|[A-Za-z]:\\(?:Users|Documents\ and\ Settings)\\[^\s\"'<>]+)"#,
+                )
+                .expect("export path redaction regex must compile")
+            });
+            *text = paths.replace_all(text, "[REDACTED_LOCAL_PATH]").to_string();
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -2097,13 +2559,51 @@ fn sanitize_export_paths(value: &mut serde_json::Value) {
     }
 }
 
+fn restrict_file_permissions(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn sanitize_stored_error(value: &str) -> String {
+    crate::scanner::redact(value)
+        .replace('\0', "")
+        .chars()
+        .take(500)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Store;
-    use crate::models::{Activity, EvolutionEntry, EvolutionSettingsInput};
+    use super::{sanitize_export_paths, Store, CURRENT_SCHEMA_VERSION};
+    use crate::models::{
+        Activity, CandidateVerification, EvolutionEntry, EvolutionSettingsInput,
+        ReflectionRunResult, RunnerConfigSnapshot,
+    };
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn redacted_exports_remove_common_absolute_local_paths() {
+        let mut payload = json!({
+            "mac": "failed at /Users/alice/project/file.rs:12",
+            "temp": "cache /private/var/folders/aa/token.json",
+            "volume": "opened file:///Volumes/Secret/data.json",
+            "windows": r"C:\Users\alice\project\secret.txt",
+            "remote": "https://api.example/v1"
+        });
+        sanitize_export_paths(&mut payload);
+        let text = payload.to_string();
+        assert!(!text.contains("alice"));
+        assert!(!text.contains("/private/var"));
+        assert!(!text.contains("/Volumes"));
+        assert!(text.contains("https://api.example/v1"));
+        assert!(text.matches("[REDACTED_LOCAL_PATH]").count() >= 4);
+    }
 
     #[test]
     fn context_mode_defaults_to_guided_and_persists_mcp() {
@@ -2118,6 +2618,115 @@ mod tests {
         }
         let reopened = Store::open(path).unwrap();
         assert_eq!(reopened.config().unwrap().context_mode, "mcp");
+    }
+
+    #[test]
+    fn schema_migrations_are_versioned_and_recorded() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let applied: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(applied, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn model_health_is_scoped_to_the_tested_configuration() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        store
+            .save_config_with_provider(
+                "remote",
+                "https://api.example.test/v1",
+                "model-a",
+                "guided",
+                90,
+            )
+            .unwrap();
+        store
+            .mark_model_health_for(
+                "ok",
+                None,
+                "remote",
+                "https://other.example.test/v1",
+                "model-b",
+            )
+            .unwrap();
+        assert_eq!(store.config().unwrap().health_status, "unknown");
+        store
+            .mark_model_health_for(
+                "ok",
+                None,
+                "remote",
+                "https://api.example.test/v1",
+                "model-a",
+            )
+            .unwrap();
+        assert_eq!(store.config().unwrap().health_status, "ok");
+    }
+
+    #[test]
+    fn persisted_model_errors_are_redacted_and_bounded() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        store
+            .save_config_with_provider(
+                "remote",
+                "https://api.example.test/v1",
+                "model-a",
+                "guided",
+                90,
+            )
+            .unwrap();
+        let secret = format!(
+            "HTTP 401 api_key=super-secret /Users/alice/project {}",
+            "x".repeat(800)
+        );
+        store
+            .mark_model_health_for(
+                "error",
+                Some(&secret),
+                "remote",
+                "https://api.example.test/v1",
+                "model-a",
+            )
+            .unwrap();
+        let error = store.config().unwrap().health_error.unwrap();
+        assert!(!error.contains("super-secret"));
+        assert!(!error.contains("/Users/alice"));
+        assert!(error.len() <= 500);
+    }
+
+    #[test]
+    fn model_pricing_round_trips_with_legacy_defaults() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        store
+            .save_config_with_fallback_and_pricing(
+                "remote",
+                "https://api.example.test/v1",
+                "model-a",
+                "guided",
+                90,
+                true,
+                "http://127.0.0.1:11434/v1",
+                "qwen3:8b",
+                90,
+                1.25,
+                5.0,
+            )
+            .unwrap();
+        let config = store.config().unwrap();
+        assert_eq!(config.input_price_per_million_usd, 1.25);
+        assert_eq!(config.output_price_per_million_usd, 5.0);
     }
 
     fn activity(id: &str) -> Activity {
@@ -2301,6 +2910,136 @@ mod tests {
         assert_eq!(run.phase, "completed");
         assert_eq!(run.consumed_activities, 8);
         assert!(run.completed_at.is_some());
+    }
+
+    #[test]
+    fn retry_configuration_snapshot_is_immutable_and_linked() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let snapshot = RunnerConfigSnapshot {
+            provider: "remote".into(),
+            base_url: "https://model.example/v1".into(),
+            model: "model-a".into(),
+            timeout_seconds: 45,
+            agent_mode: "verification".into(),
+            auto_activate_low_risk: false,
+            max_agent_steps: 7,
+            fallback_enabled: true,
+            fallback_base_url: "http://127.0.0.1:11435/v1".into(),
+            fallback_model: "local-a".into(),
+            fallback_timeout_seconds: 30,
+            input_price_per_million_usd: 1.25,
+            output_price_per_million_usd: 5.0,
+        };
+        store
+            .start_evolution_run_with_snapshot(
+                "run-retry",
+                "manual",
+                Some("model-a"),
+                &["codex".into()],
+                7,
+                &snapshot,
+                Some("run-source"),
+            )
+            .unwrap();
+        store
+            .save_config_with_provider(
+                "remote",
+                "https://changed.example/v1",
+                "model-b",
+                "guided",
+                90,
+            )
+            .unwrap();
+
+        let saved = store
+            .evolution_run_config_snapshot("run-retry")
+            .unwrap()
+            .unwrap();
+        let run = store.current_evolution_run().unwrap().unwrap();
+        assert_eq!(saved.base_url, "https://model.example/v1");
+        assert_eq!(saved.model, "model-a");
+        assert_eq!(saved.agent_mode, "verification");
+        assert!(!saved.auto_activate_low_risk);
+        assert_eq!(run.retry_of_run_id.as_deref(), Some("run-source"));
+    }
+
+    #[test]
+    fn legacy_retry_snapshot_defaults_missing_pricing() {
+        let snapshot: RunnerConfigSnapshot = serde_json::from_value(json!({
+            "provider": "remote",
+            "baseUrl": "https://model.example/v1",
+            "model": "model-a",
+            "timeoutSeconds": 45,
+            "agentMode": "reflection",
+            "autoActivateLowRisk": false,
+            "maxAgentSteps": 6,
+            "fallbackEnabled": true,
+            "fallbackBaseUrl": "http://127.0.0.1:11434/v1",
+            "fallbackModel": "qwen3:8b",
+            "fallbackTimeoutSeconds": 30
+        }))
+        .unwrap();
+        assert_eq!(snapshot.input_price_per_million_usd, 0.0);
+        assert_eq!(snapshot.output_price_per_million_usd, 0.0);
+    }
+
+    #[test]
+    fn candidate_verifications_persist_with_the_run() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let entry = EvolutionEntry {
+            id: "entry-verified".into(),
+            kind: "skill".into(),
+            title: "Verify before activation".into(),
+            summary: "Use redacted evidence".into(),
+            body: "Read the evidence and check conflicts.".into(),
+            status: "pending".into(),
+            risk: "review".into(),
+            source_refs: vec!["activity-1".into()],
+            updated_at: 1,
+            origin_run_id: Some("run-verified".into()),
+            target_entry_id: None,
+            version: 1,
+        };
+        let result = ReflectionRunResult {
+            run_id: "run-verified".into(),
+            generated: vec![entry],
+            activated: 0,
+            pending: 1,
+            discarded: 0,
+            message: "done".into(),
+            verification_status: "review_required".into(),
+            verification_summary: Some("one candidate".into()),
+            candidate_verifications: vec![CandidateVerification {
+                run_id: "run-verified".into(),
+                entry_id: "entry-verified".into(),
+                evidence_sufficient: true,
+                supporting_evidence: vec!["activity-1".into()],
+                contradicting_evidence: Vec::new(),
+                confidence: 0.88,
+                duplicate: false,
+                conflict: false,
+                recommendation: "review".into(),
+                rationale: "single source".into(),
+            }],
+            provider_used: "remote".into(),
+            fallback_count: 0,
+            input_activity_count: 1,
+            input_tokens: 12,
+            output_tokens: 8,
+            duration_ms: 20,
+            estimated_cost_usd: None,
+        };
+        store.persist_reflection_result(&result).unwrap();
+
+        let saved = store
+            .candidate_verifications_for_run("run-verified")
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].entry_id, "entry-verified");
+        assert_eq!(saved[0].supporting_evidence, vec!["activity-1"]);
+        assert_eq!(saved[0].confidence, 0.88);
     }
 
     #[test]

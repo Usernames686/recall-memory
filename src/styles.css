@@ -303,6 +303,20 @@ h1, h2, h3, p { letter-spacing: 0; }
 .run-output-list { display: grid; }
 .run-output-row { display: grid; grid-template-columns: 34px minmax(0,1fr); align-items: center; min-height: 72px; gap: 11px; border-top: 1px solid var(--border); }
 .run-output-row:first-child { border-top: 0; }
+.entry-evidence { margin-top: 8px; color: var(--ink-3); font-size: 8px; }
+.entry-evidence summary { cursor: pointer; color: var(--accent); }
+.evidence-drawer { position: fixed; z-index: 20; inset: 8% 8% auto auto; width: min(560px, 84vw); max-height: 82vh; overflow: auto; padding: 20px; background: var(--panel); border: 1px solid var(--border); box-shadow: 0 22px 70px rgba(24,35,27,.22); }
+.evidence-drawer > p { color: var(--ink-2); font-size: 12px; line-height: 1.6; }
+.evidence-drawer .evidence-item { margin-top: 9px; padding: 10px; background: var(--panel-2); border: 1px solid var(--border); }
+.candidate-verification { display: grid; margin: 12px 0; padding: 11px; gap: 6px; color: var(--ink-2); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 9px; line-height: 1.45; }
+.candidate-verification-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.candidate-verification-head strong { color: var(--accent); font-size: 10px; }
+.candidate-verification-head span { color: var(--ink-3); font-family: "Geist Mono", monospace; }
+.candidate-verification small { color: var(--ink-3); overflow-wrap: anywhere; }
+.usage-panel { margin-top: 10px; }
+.evidence-item { margin-top: 6px; padding: 7px 8px; border-left: 2px solid var(--accent); background: var(--panel-2); }
+.evidence-item span { color: var(--ink-3); }
+.evidence-item p { margin: 3px 0 0; color: var(--ink-2); }
 .range-toolbar { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; padding: 13px 15px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); }
 .range-toolbar strong, .range-toolbar span { display: block; }.range-toolbar strong { font-size: 11px; }.range-toolbar span { margin-top: 3px; color: var(--ink-3); font-size: 8px; }
 .provider-card { grid-template-columns: 40px minmax(0,1fr); }

@@ -28,6 +28,18 @@ For a release bundle:
 pnpm tauri:build
 ```
 
+For a Universal macOS bundle, install both Rust targets and build the universal
+main app and MCP sidecar together:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+pnpm tauri:build:universal
+```
+
+Developer ID signing, notarization, and updater signatures require the release
+owner's Apple certificate and Tauri signing secrets; unsigned local builds are
+for development and MVP demonstrations only.
+
 The default local model configuration is `http://127.0.0.1:11434/v1` with `qwen3:8b`. An OpenAI-compatible endpoint can be configured in the Settings page. API keys are stored in the macOS Keychain, not SQLite.
 
 ## Verification
@@ -36,5 +48,9 @@ The default local model configuration is `http://127.0.0.1:11434/v1` with `qwen3
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 pnpm build
 ```
+
+The real remote tool-calling acceptance test is opt-in and documented in
+[`REAL_MODEL_E2E.md`](REAL_MODEL_E2E.md). It reads credentials only from
+environment variables and is excluded from the default test suite.
 
 The generated macOS app and DMG are build artifacts and are intentionally excluded from Git by `.gitignore`.

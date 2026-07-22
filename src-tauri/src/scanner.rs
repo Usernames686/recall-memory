@@ -612,8 +612,8 @@ pub(crate) fn redact(text: &str) -> String {
                 r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+",
                 "$1[REDACTED_API_KEY]",
             ),
-            (r"(?i)(sk-[a-z0-9_-]{12,})", "[REDACTED_API_KEY]"),
             (r"(?i)(bearer\s+)[a-z0-9._-]{12,}", "$1[REDACTED_TOKEN]"),
+            (r"(?i)(sk-[a-z0-9_-]{12,})", "[REDACTED_API_KEY]"),
             (r"(?i)(password\s*[:=]\s*)[^\s,;]+", "$1[REDACTED]"),
             (
                 r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@",
@@ -708,6 +708,7 @@ mod tests {
     use super::{parse_claude, parse_codex, redact, scan_directory, scan_sources};
     use crate::models::{ScanSummary, SourceSummary};
     use crate::store::Store;
+    use proptest::prelude::*;
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
@@ -774,6 +775,32 @@ mod tests {
         assert!(cleaned.contains("[REDACTED_PRIVATE_KEY]"));
         assert!(!cleaned.contains("alice@example.com"));
         assert!(!cleaned.contains("secret-material"));
+    }
+
+    proptest! {
+        #[test]
+        fn generated_credentials_and_user_paths_never_survive_redaction(
+            token in "[a-zA-Z0-9_-]{20,48}",
+            user in "[a-z]{3,12}",
+            local in "[a-z]{3,12}",
+            domain in "[a-z]{3,10}"
+        ) {
+            let api_key = format!("sk-{token}");
+            let bearer = format!("Bearer {token}");
+            let email = format!("{local}@{domain}.com");
+            let path = format!("/Users/{user}/private/project");
+            let user_root = format!("/Users/{user}");
+            let input = format!("api_key={api_key} auth={bearer} mail={email} path={path}");
+            let cleaned = redact(&input);
+
+            prop_assert!(!cleaned.contains(&api_key));
+            prop_assert!(!cleaned.contains(&token));
+            prop_assert!(!cleaned.contains(&email));
+            prop_assert!(!cleaned.contains(&user_root));
+            prop_assert!(cleaned.contains("[REDACTED_API_KEY]"));
+            prop_assert!(cleaned.contains("[REDACTED_TOKEN]"));
+            prop_assert!(cleaned.contains("[REDACTED_EMAIL]"));
+        }
     }
 
     #[test]

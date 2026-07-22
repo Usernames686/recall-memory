@@ -2,7 +2,9 @@ use crate::paths;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::path::Path;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Notify;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -11,8 +13,17 @@ struct SourceDirtyEvent {
     source: String,
 }
 
-pub fn start(app: AppHandle) -> notify::Result<RecommendedWatcher> {
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceWatchErrorEvent {
+    provider: String,
+    source: String,
+    error: String,
+}
+
+pub fn start(app: AppHandle, activity_signal: Arc<Notify>) -> notify::Result<RecommendedWatcher> {
     let callback_app = app.clone();
+    let status_app = app.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
             let Ok(event) = result else { return };
@@ -21,6 +32,7 @@ pub fn start(app: AppHandle) -> notify::Result<RecommendedWatcher> {
                     continue;
                 }
                 let provider = provider_for(&path);
+                activity_signal.notify_one();
                 let _ = callback_app.emit(
                     "source-dirty",
                     SourceDirtyEvent {
@@ -39,7 +51,17 @@ pub fn start(app: AppHandle) -> notify::Result<RecommendedWatcher> {
         paths::claude_home().join("projects"),
     ] {
         if path.is_dir() {
-            watcher.watch(&path, RecursiveMode::Recursive)?;
+            if let Err(error) = watcher.watch(&path, RecursiveMode::Recursive) {
+                let provider = provider_for(&path);
+                let _ = status_app.emit(
+                    "source-watch-error",
+                    SourceWatchErrorEvent {
+                        provider: provider.to_string(),
+                        source: hashed_source(&path),
+                        error: crate::scanner::redact(&error.to_string()),
+                    },
+                );
+            }
         }
     }
     Ok(watcher)

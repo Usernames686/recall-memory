@@ -63,6 +63,17 @@ pub fn handle_request(store: &Store, request: &Value) -> Value {
         "tools/call" => call_tool(store, request.get("params").unwrap_or(&Value::Null)),
         _ => Err(format!("unsupported method: {method}")),
     };
+    if method == "tools/call" {
+        let name = request
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let action = request
+            .pointer("/params/arguments/action")
+            .and_then(Value::as_str);
+        let status = if result.is_ok() { "ok" } else { "error" };
+        let _ = store.append_mcp_call(name, action, status);
+    }
     match result {
         Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
         Err(message) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":message}}),
@@ -271,11 +282,13 @@ pub fn install(sidecar_path: &Path, store_path: &Path) -> Result<McpInstallResul
     if codex_path.exists() {
         let backup = paths::backup_path(&codex_path);
         fs::copy(&codex_path, &backup)?;
+        restrict_file_permissions(&backup)?;
         backups.push(backup.display().to_string());
     }
     if claude_path.exists() {
         let backup = paths::backup_path(&claude_path);
         fs::copy(&claude_path, &backup)?;
+        restrict_file_permissions(&backup)?;
         backups.push(backup.display().to_string());
     }
     install_codex(&codex_path, sidecar_path, store_path)?;
@@ -286,6 +299,74 @@ pub fn install(sidecar_path: &Path, store_path: &Path) -> Result<McpInstallResul
         backups,
         sidecar_path: sidecar_path.display().to_string(),
     })
+}
+
+pub fn uninstall() -> Result<Value, McpError> {
+    let codex = restore_or_remove_codex(&paths::codex_config_path())?;
+    let claude = restore_or_remove_claude(&paths::claude_config_path())?;
+    Ok(json!({
+        "codexRestored": codex,
+        "claudeRestored": claude,
+        "message": "Recall MCP 配置已卸载；其他配置保持不变"
+    }))
+}
+
+fn latest_backup(path: &Path) -> Result<Option<PathBuf>, McpError> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let prefix = format!(
+        "{}.",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config")
+    );
+    let mut backups = fs::read_dir(parent)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&prefix) && name.contains("recall-backup-"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    Ok(backups.pop())
+}
+
+fn restore_or_remove_codex(path: &Path) -> Result<bool, McpError> {
+    if let Some(backup) = latest_backup(path)? {
+        fs::copy(backup, path)?;
+        return Ok(true);
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    let source = fs::read_to_string(path)?;
+    let mut doc = source.parse::<DocumentMut>()?;
+    if let Some(table) = doc["mcp_servers"].as_table_mut() {
+        table.remove("recall");
+    }
+    atomic_write(path, doc.to_string().as_bytes())?;
+    Ok(false)
+}
+
+fn restore_or_remove_claude(path: &Path) -> Result<bool, McpError> {
+    if let Some(backup) = latest_backup(path)? {
+        fs::copy(backup, path)?;
+        return Ok(true);
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut root: Value = serde_json::from_slice(&fs::read(path)?)?;
+    if let Some(map) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        map.remove("recall");
+    }
+    atomic_write(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
+    Ok(false)
 }
 
 fn install_codex(path: &Path, sidecar: &Path, store: &Path) -> Result<(), McpError> {
@@ -369,6 +450,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), McpError> {
     Ok(())
 }
 
+fn restrict_file_permissions(path: &Path) -> Result<(), McpError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 pub fn sidecar_path() -> Result<PathBuf, McpError> {
     let exe = std::env::current_exe()?;
     let parent = exe
@@ -446,7 +536,7 @@ pub fn smoke_test(sidecar: &Path, store_path: &Path) -> Result<Value, McpError> 
     }))
 }
 
-pub fn status() -> McpStatus {
+pub fn status(store: &Store) -> McpStatus {
     let codex = fs::read_to_string(paths::codex_config_path())
         .map(|content| {
             content.contains("[mcp_servers.recall]")
@@ -462,12 +552,16 @@ pub fn status() -> McpStatus {
         codex,
         claude,
         last_checked: Some(Utc::now().timestamp()),
+        recent_calls: store.recent_mcp_calls(20).unwrap_or_default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_request, install_claude, install_codex};
+    use super::{
+        handle_request, install_claude, install_codex, restore_or_remove_claude,
+        restore_or_remove_codex,
+    };
     use crate::models::EvolutionEntry;
     use crate::store::Store;
     use serde_json::Value;
@@ -648,6 +742,54 @@ mod tests {
         assert!(claude_json.pointer("/mcpServers/existing").is_some());
         assert!(claude_json.pointer("/mcpServers/recall").is_some());
         assert_eq!(std::fs::read_to_string(&claude).unwrap(), first_claude);
+    }
+
+    #[test]
+    fn uninstall_restores_latest_backup_or_only_removes_recall() {
+        let dir = tempdir().unwrap();
+        let codex = dir.path().join("config.toml");
+        let claude = dir.path().join("claude.json");
+        std::fs::write(&codex, "model = \"before\"\n").unwrap();
+        std::fs::write(&claude, r#"{"theme":"dark"}"#).unwrap();
+        let codex_backup = dir.path().join("config.toml.recall-backup-20990101000000");
+        let claude_backup = dir.path().join("claude.json.recall-backup-20990101000000");
+        std::fs::copy(&codex, &codex_backup).unwrap();
+        std::fs::copy(&claude, &claude_backup).unwrap();
+        std::fs::write(
+            &codex,
+            "model = \"after\"\n[mcp_servers.recall]\ncommand=\"sidecar\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &claude,
+            r#"{"theme":"light","mcpServers":{"recall":{"command":"sidecar"}}}"#,
+        )
+        .unwrap();
+
+        assert!(restore_or_remove_codex(&codex).unwrap());
+        assert!(restore_or_remove_claude(&claude).unwrap());
+        assert!(std::fs::read_to_string(&codex).unwrap().contains("before"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&claude).unwrap()).unwrap()["theme"],
+            "dark"
+        );
+
+        std::fs::remove_file(&codex_backup).unwrap();
+        std::fs::remove_file(&claude_backup).unwrap();
+        std::fs::write(
+            &codex,
+            "model = \"keep\"\n[mcp_servers.recall]\ncommand=\"sidecar\"\n[ui]\ntheme=\"dark\"\n",
+        )
+        .unwrap();
+        std::fs::write(&claude, r#"{"theme":"dark","mcpServers":{"recall":{"command":"sidecar"},"other":{"command":"keep"}}}"#).unwrap();
+        assert!(!restore_or_remove_codex(&codex).unwrap());
+        assert!(!restore_or_remove_claude(&claude).unwrap());
+        assert!(std::fs::read_to_string(&codex)
+            .unwrap()
+            .contains("theme=\"dark\""));
+        let claude_root: Value = serde_json::from_slice(&std::fs::read(&claude).unwrap()).unwrap();
+        assert!(claude_root["mcpServers"]["other"].is_object());
+        assert!(claude_root["mcpServers"]["recall"].is_null());
     }
 
     #[test]
